@@ -1,0 +1,12 @@
+Source: ros-humble-mola-sm-loop-closure
+Section: misc
+Priority: optional
+Maintainer: Jose-Luis Blanco-Claraco <joseluisblancoc@gmail.com>
+Build-Depends: debhelper (>= 9.0.0), cmake, ros-humble-ament-cmake, ros-humble-ament-cmake-gtest, ros-humble-ament-cmake-lint-cmake <!nocheck>, ros-humble-ament-cmake-pep257 <!nocheck>, ros-humble-ament-cmake-uncrustify <!nocheck>, ros-humble-ament-cmake-xmllint <!nocheck>, ros-humble-ament-lint-auto <!nocheck>, ros-humble-gtsam, ros-humble-mola-common, ros-humble-mola-georeferencing, ros-humble-mola-gtsam-factors, ros-humble-mola-metric-maps <!nocheck>, ros-humble-mola-pose-list, ros-humble-mola-relocalization, ros-humble-mola-test-datasets <!nocheck>, ros-humble-mola-yaml, ros-humble-mp2p-icp, ros-humble-mrpt-libgui, ros-humble-mrpt-libmaps, ros-humble-mrpt-libtclap, ros-humble-ros-environment, ros-humble-ros-workspace
+Homepage: https://docs.mola-slam.org/
+Standards-Version: 3.9.2
+
+Package: ros-humble-mola-sm-loop-closure
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, ros-humble-gtsam, ros-humble-mola-common, ros-humble-mola-georeferencing, ros-humble-mola-gtsam-factors, ros-humble-mola-pose-list, ros-humble-mola-relocalization, ros-humble-mola-yaml, ros-humble-mp2p-icp, ros-humble-mrpt-libgui, ros-humble-mrpt-libmaps, ros-humble-mrpt-libtclap, ros-humble-ros-workspace
+Description: Simplemap loop-closure postprocessing library and CLI tool
