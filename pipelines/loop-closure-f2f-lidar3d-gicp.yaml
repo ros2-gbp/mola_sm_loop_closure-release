@@ -10,7 +10,7 @@
 params:
   # ===== GNSS Optimization Parameters =====
   use_gnss: "${USE_GNSS|true}"
-  gnss_minimum_uncertainty_xyz: 0.10 # [m] Minimum GPS uncertainty
+  gnss_minimum_uncertainty_xyz: ${LC_GNSS_MINIMUM_XYZ_SIGMA|0.10} # [m] Minimum GPS uncertainty
   gnss_add_horizontality: false # Add constraints for flat terrain
   gnss_horizontality_sigma_z: 0.10 # [m] Z-axis constraint if enabled
   gnss_edges_uncertainty_multiplier: "${GNSS_EDGES_UNCERTAINTY_MULTIPLIER|1.0}"
@@ -56,6 +56,7 @@ params:
   save_trajectory_files: true
   save_trajectory_files_with_cov: true
   debug_files_prefix: "f2f_lc_"
+  min_icp_goodness_to_save_icplog: ${MIN_ICP_QUALITY_TO_SAVE_ICPLOG|0.50}
 
   # ===== 3D Scene Visualization Output =====
   save_3d_scene_files: "${SAVE_3D_SCENES|false}"
@@ -71,6 +72,31 @@ params:
   scene_lc_color_b: 0.0
   scene_lc_color_a: 0.8
   scene_keyframe_point_size: 7.0
+
+  # ===== Planar World Annealing =====
+  # When enabled, a planarity constraint (z≈0, roll≈0, pitch≈0) is added for
+  # each keyframe. It starts strong at LC round 0 and is exponentially relaxed
+  # over `planar_world_annealing_rounds` rounds, then removed entirely.
+  # Useful for robots that operate on flat ground but may have slight
+  # sensor-tilt or slope-induced drift in z/roll/pitch.
+  assume_planar_world: "${ASSUME_PLANAR_WORLD|false}"
+  planar_world_initial_sigma_z: "${PLANAR_WORLD_SIGMA_Z|0.10}"       # [m]   sigma at round 0
+  planar_world_initial_sigma_ang: "${PLANAR_WORLD_SIGMA_ANG|0.02}"   # [rad] sigma at round 0 (~1 deg)
+  planar_world_annealing_rounds: "${PLANAR_WORLD_ANNEALING_ROUNDS|2}" # rounds until constraint vanishes
+
+  # ===== Manual Loop Closure Constraints =====
+  # Optional: force loop closure edges between specific keyframes identified by
+  # their UNIX timestamp (as a double, compatible with mrpt::Clock::toDouble()).
+  # The nearest frame in the simplemap to each timestamp is used.
+  # sigma_xyz [m] sets the positional uncertainty; rotation is left unconstrained.
+  #
+  # manual_loop_constraints:
+  # - timestamp_i: 1700000100.250   # UNIX time of first keyframe
+  #   timestamp_j: 1700000345.875   # UNIX time of second keyframe
+  #   sigma_xyz: 0.10               # [m] positional sigma
+  # - timestamp_i: 1700000210.500
+  #   timestamp_j: 1700000512.000
+  #   sigma_xyz: 0.20
 
 # ===== ICP Settings =====
 # (Your existing ICP pipeline configuration goes here)
@@ -190,6 +216,7 @@ observations_filter:
       input_pointcloud_layer: "raw"
       output_pointcloud_layer: "deskewed"
       method: "${MOLA_DESKEW_METHOD|MotionCompensationMethod::IMU}"
+      ignore_accelerometer: "${MOLA_DESKEW_IGNORE_ACCELEROMETER|false}"
       silently_ignore_no_timestamps: "${MOLA_DESKEW_IGNORE_NO_TIMESTAMPS|false}" # To handle more dataset types
       output_layer_class: "mrpt::maps::CGenericPointsMap" # Keep intensity & ring channels
 
