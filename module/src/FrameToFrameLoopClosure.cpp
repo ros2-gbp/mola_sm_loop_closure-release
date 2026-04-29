@@ -21,9 +21,6 @@
 #include <mola_gtsam_factors/FactorGnssEnu.h>
 #include <mola_gtsam_factors/gtsam_detect_version.h>
 #include <mola_sm_loop_closure/FrameToFrameLoopClosure.h>
-#include <mola_sm_loop_closure/common/gnc_optimizer.h>
-#include <mola_sm_loop_closure/common/obs_helpers.h>
-#include <mola_sm_loop_closure/common/planarity_factors.h>
 #include <mola_yaml/yaml_helpers.h>
 #include <mp2p_icp/update_velocity_buffer_from_obs.h>
 #include <mrpt/core/get_env.h>
@@ -53,7 +50,32 @@ namespace
 const bool PRINT_LC_SCORES = mrpt::get_env<bool>("PRINT_LC_SCORES", false);
 const bool SAVE_ICP_LOGS   = mrpt::get_env<bool>("SAVE_ICP_LOGS", false);
 
-using mola::lc_common::frame_has_mapping_observations;
+bool frame_has_mapping_observations(const mrpt::obs::CSensoryFrame& sf)
+{
+    if (sf.empty())
+    {
+        return false;
+    }
+
+    if (sf.getObservationByClass<mrpt::obs::CObservationPointCloud>())
+    {
+        return true;
+    }
+    if (sf.getObservationByClass<mrpt::obs::CObservation2DRangeScan>())
+    {
+        return true;
+    }
+    if (sf.getObservationByClass<mrpt::obs::CObservation3DRangeScan>())
+    {
+        return true;
+    }
+    if (sf.getObservationByClass<mrpt::obs::CObservationVelodyneScan>())
+    {
+        return true;
+    }
+
+    return false;
+}
 
 /**
  * Compute score using original proximity-only strategy
@@ -203,7 +225,6 @@ void FrameToFrameLoopClosure::initialize(const mrpt::containers::yaml& c)
     }
 
     YAML_LOAD_OPT(params_, min_icp_goodness, double);
-    YAML_LOAD_OPT(params_, min_icp_goodness_to_save_icplog, double);
     YAML_LOAD_OPT(params_, icp_edge_robust_param, double);
     YAML_LOAD_OPT(params_, icp_edge_additional_noise_xyz, double);
     YAML_LOAD_OPT(params_, icp_edge_additional_noise_ang, double);
@@ -216,11 +237,6 @@ void FrameToFrameLoopClosure::initialize(const mrpt::containers::yaml& c)
 
     YAML_LOAD_OPT(params_, pc_cache_max_bytes, size_t);
     YAML_LOAD_OPT(params_, unload_observations_after_use, bool);
-
-    YAML_LOAD_OPT(params_, assume_planar_world, bool);
-    YAML_LOAD_OPT(params_, planar_world_initial_sigma_z, double);
-    YAML_LOAD_OPT(params_, planar_world_initial_sigma_ang, double);
-    YAML_LOAD_OPT(params_, planar_world_annealing_rounds, size_t);
 
     YAML_LOAD_OPT(params_, largest_delta_for_reconsider, double);
     YAML_LOAD_OPT(params_, max_sensor_range, double);
@@ -243,32 +259,6 @@ void FrameToFrameLoopClosure::initialize(const mrpt::containers::yaml& c)
     YAML_LOAD_OPT(params_, scene_lc_color_b, float);
     YAML_LOAD_OPT(params_, scene_lc_color_a, float);
     YAML_LOAD_OPT(params_, scene_keyframe_point_size, float);
-
-    // Load manual loop closure hints
-    if (cfg.has("manual_loop_constraints") && !cfg["manual_loop_constraints"].isNullNode())
-    {
-        for (const auto& entryNode : cfg["manual_loop_constraints"].asSequenceRange())
-        {
-            ASSERT_(entryNode.isMap());
-            const auto& entry = entryNode.asMap();
-
-            Parameters::ManualLoopConstraint mlc;
-            ASSERTMSG_(
-                entry.count("timestamp_i") != 0 && entry.count("timestamp_j") != 0 &&
-                    entry.count("sigma_xyz") != 0,
-                "Each manual_loop_constraints entry must have: timestamp_i, timestamp_j, "
-                "sigma_xyz");
-
-            mlc.timestamp_i = entry.at("timestamp_i").as<double>();
-            mlc.timestamp_j = entry.at("timestamp_j").as<double>();
-            mlc.sigma_xyz   = entry.at("sigma_xyz").as<double>();
-
-            params_.manual_loop_constraints.push_back(mlc);
-        }
-        MRPT_LOG_INFO_STREAM(
-            "Loaded " << params_.manual_loop_constraints.size()
-                      << " manual loop closure constraint(s) from config.");
-    }
 
     profiler_.enable(params_.profiler_enabled);
 
@@ -311,7 +301,7 @@ void FrameToFrameLoopClosure::initialize(const mrpt::containers::yaml& c)
         [this](const mp2p_icp::LogRecord& log) -> bool
     {
         return params_.icp_parameters.generateDebugFiles &&
-               log.icpResult.quality >= params_.min_icp_goodness_to_save_icplog;
+               log.icpResult.quality >= params_.min_icp_goodness;
     };
 #endif
 
@@ -353,18 +343,6 @@ void FrameToFrameLoopClosure::process(mrpt::maps::CSimpleMap& sm)  // NOLINT
     // Build initial graph with odometry edges
     build_initial_graph();
 
-    // Seed planarity constraint at full strength before any optimization
-    if (params_.assume_planar_world)
-    {
-        build_planarity_factors(
-            params_.planar_world_initial_sigma_z, params_.planar_world_initial_sigma_ang);
-        MRPT_LOG_INFO_STREAM(
-            "Planar-world annealing enabled: initial sigma_z="
-            << params_.planar_world_initial_sigma_z
-            << " m, sigma_ang=" << params_.planar_world_initial_sigma_ang << " rad, over "
-            << params_.planar_world_annealing_rounds << " LC rounds");
-    }
-
     if (params_.save_trajectory_files)
     {
         optimize_graph();
@@ -391,21 +369,6 @@ void FrameToFrameLoopClosure::process(mrpt::maps::CSimpleMap& sm)  // NOLINT
         }
     }
 
-    // Add manual loop closure constraints, if any
-    if (!params_.manual_loop_constraints.empty())
-    {
-        add_manual_loop_closure_factors();
-        MRPT_LOG_INFO("Running optimization after manual loop closure constraints...");
-        optimize_graph();
-
-        if (params_.save_trajectory_files)
-        {
-            save_trajectory_as_tum(
-                params_.debug_files_prefix + "after_manual_lc.tum"s,
-                params_.save_trajectory_files_with_cov);
-        }
-    }
-
     if (params_.save_3d_scene_files)
     {
         save_3d_scene_initial_files();
@@ -417,35 +380,6 @@ void FrameToFrameLoopClosure::process(mrpt::maps::CSimpleMap& sm)  // NOLINT
 
     for (size_t lcRound = 0; lcRound < params_.max_lc_optimization_rounds; lcRound++)
     {
-        // Anneal planar-world constraint: grows from initial sigma to 1e6 over
-        // planar_world_annealing_rounds, then the constraint is dropped entirely.
-        if (params_.assume_planar_world)
-        {
-            const size_t N = params_.planar_world_annealing_rounds;
-            if (lcRound >= N)
-            {
-                state_.planarityFG.resize(0);
-                if (lcRound == N)
-                {
-                    MRPT_LOG_INFO("Planar-world constraint fully annealed out.");
-                }
-            }
-            else
-            {
-                lc_common::PlanarAnneal pa;
-                pa.rounds         = N;
-                pa.initSigmaZ     = params_.planar_world_initial_sigma_z;
-                pa.initSigmaAng   = params_.planar_world_initial_sigma_ang;
-                const auto sigmas = lc_common::planar_sigmas_for_round(pa, lcRound);
-                ASSERT_(sigmas.has_value());
-                const auto [sigmaZ, sigmaAng] = *sigmas;
-                build_planarity_factors(sigmaZ, sigmaAng);
-                MRPT_LOG_INFO_STREAM(
-                    "Planar-world round " << lcRound << "/" << N << ": sigma_z=" << sigmaZ
-                                          << " m, sigma_ang=" << sigmaAng << " rad");
-            }
-        }
-
         size_t checkedCount   = 0;
         bool   anyGraphChange = false;
 
@@ -667,9 +601,30 @@ void FrameToFrameLoopClosure::add_gnss_factors()
     // Add GNSS factors for each frame
     for (const auto& gf : gnssFrames.frames)
     {
-        // kf_index is already set by extract_gnss_frames_from_sm
-        const frame_id_t frameId = static_cast<frame_id_t>(gf.kf_index);
-        if (frameId >= static_cast<frame_id_t>(sm.size()))
+        // Find which frame this corresponds to
+        frame_id_t frameId = 0;
+        bool       found   = false;
+
+        for (size_t i = 0; i < sm.size(); i++)
+        {
+            const auto& [pose, sf, twist] = sm.get(i);
+
+            for (const auto& obs : *sf)
+            {
+                if (obs.get() == gf.obs.get())
+                {
+                    frameId = i;
+                    found   = true;
+                    break;
+                }
+            }
+            if (found)
+            {
+                break;
+            }
+        }
+
+        if (!found)
         {
             continue;
         }
@@ -691,124 +646,6 @@ void FrameToFrameLoopClosure::add_gnss_factors()
         state_.graphFG.emplace_shared<mola::factors::FactorGnssEnu>(
             X(frameId), sensorPointOnVeh, observedENU, robustNoise);
     }
-}
-
-void FrameToFrameLoopClosure::add_manual_loop_closure_factors()
-{
-    using gtsam::symbol_shorthand::X;
-
-    mrpt::system::CTimeLoggerEntry tle(profiler_, "add_manual_loop_closure_factors");
-
-    ASSERT_(state_.sm);
-    const auto& sm = *state_.sm;
-
-    // Build a timestamp => frame_id lookup table once
-    // (timestamps come from the first observation in each sensory frame)
-    std::vector<std::pair<double, frame_id_t>> tsIndex;
-    tsIndex.reserve(sm.size());
-
-    for (size_t i = 0; i < sm.size(); i++)
-    {
-        const auto& kf = sm.get(i);
-        if (!kf.sf || kf.sf->empty())
-        {
-            continue;
-        }
-        const auto obs = kf.sf->getObservationByIndex(0);
-        if (!obs)
-        {
-            continue;
-        }
-        tsIndex.emplace_back(mrpt::Clock::toDouble(obs->timestamp), static_cast<frame_id_t>(i));
-    }
-
-    // Sort by timestamp for fast nearest-neighbour lookup
-    std::sort(tsIndex.begin(), tsIndex.end());
-
-    // Helper: find the frame_id whose timestamp is closest to a query value
-    auto findClosestFrame = [&](double queryTs) -> std::optional<frame_id_t>
-    {
-        if (tsIndex.empty())
-        {
-            return std::nullopt;
-        }
-
-        // Lower bound by timestamp
-        auto it = std::lower_bound(
-            tsIndex.begin(), tsIndex.end(), std::make_pair(queryTs, frame_id_t{0}));
-
-        if (it == tsIndex.end())
-        {
-            return tsIndex.back().second;
-        }
-        if (it == tsIndex.begin())
-        {
-            return it->second;
-        }
-
-        auto prev = std::prev(it);
-        return (std::abs(it->first - queryTs) < std::abs(prev->first - queryTs)) ? it->second
-                                                                                 : prev->second;
-    };
-
-    size_t addedCount = 0;
-
-    for (const auto& mlc : params_.manual_loop_constraints)
-    {
-        const auto fi_opt = findClosestFrame(mlc.timestamp_i);
-        const auto fj_opt = findClosestFrame(mlc.timestamp_j);
-
-        if (!fi_opt || !fj_opt)
-        {
-            MRPT_LOG_WARN("Manual LC: could not find frames for the given timestamps; skipping.");
-            continue;
-        }
-
-        const frame_id_t fi = *fi_opt;
-        const frame_id_t fj = *fj_opt;
-
-        if (fi == fj)
-        {
-            MRPT_LOG_WARN_STREAM(
-                "Manual LC: timestamps map to the same frame (" << fi << "); skipping.");
-            continue;
-        }
-
-        // Relative pose: identity since we are assuming this is roughly a loop-closure:
-        const auto deltaPose = gtsam::Pose3::Identity();
-
-        // Tight sigma on XYZ, very loose on angles (leave orientation free)
-        constexpr double LARGE_ANGLE_SIGMA = 1e3;  // [rad] effectively unconstrained
-        gtsam::Vector6   sigmas;
-        // GTSAM Pose3 noise order: rx, ry, rz, tx, ty, tz
-        sigmas << LARGE_ANGLE_SIGMA, LARGE_ANGLE_SIGMA, LARGE_ANGLE_SIGMA, mlc.sigma_xyz,
-            mlc.sigma_xyz, mlc.sigma_xyz;
-
-        auto edgeNoise = gtsam::noiseModel::Diagonal::Sigmas(sigmas);
-
-        // Mark as known inlier (manual constraints are trusted)
-        state_.knownInlierFactorIndices.push_back(state_.graphFG.size());
-
-#if GTSAM_USES_BOOST
-        auto factor = boost::make_shared<gtsam::BetweenFactor<gtsam::Pose3>>(
-            X(fi), X(fj), deltaPose, edgeNoise);
-#else
-        auto factor = std::make_shared<gtsam::BetweenFactor<gtsam::Pose3>>(
-            X(fi), X(fj), deltaPose, edgeNoise);
-#endif
-        state_.graphFG += factor;
-
-        // Track for 3D scene output
-        accepted_lc_edges_.emplace_back(fi, fj);
-        addedCount++;
-
-        MRPT_LOG_INFO_STREAM(
-            "Manual LC added: frame " << fi << " (t=" << mlc.timestamp_i << ") <-> frame " << fj
-                                      << " (t=" << mlc.timestamp_j
-                                      << ")  sigma_xyz=" << mlc.sigma_xyz << " m");
-    }
-
-    MRPT_LOG_INFO_STREAM("Added " << addedCount << " manual loop closure factor(s).");
 }
 
 auto FrameToFrameLoopClosure::
@@ -1266,34 +1103,89 @@ double FrameToFrameLoopClosure::optimize_graph()
 
     ASSERT_(!state_.graphFG.empty());
 
-    const auto result = lc_common::run_gnc(
-        state_.graphFG, state_.planarityFG, state_.graphValues, state_.knownInlierFactorIndices,
-        this);
+    const auto N_1 = 1.0 / static_cast<double>(state_.graphFG.size());
 
+    const double errInit1  = state_.graphFG.error(state_.graphValues);
+    const double rmseInit1 = std::sqrt(errInit1 * N_1);
+
+    // Use Graduated Non-Convexity (GNC) optimizer with Geman-McClure loss.
+    // This handles large loop closure corrections that would otherwise be
+    // suppressed by a fixed robust kernel, while still rejecting outliers.
+    using GncParams = gtsam::GncParams<gtsam::LevenbergMarquardtParams>;
+
+    auto lmParams = gtsam::LevenbergMarquardtParams::CeresDefaults();
+
+    GncParams gncParams(lmParams);
+    gncParams.setLossType(gtsam::GncLossType::GM);
+    GncParams::IndexVector knownInliers(
+        state_.knownInlierFactorIndices.begin(), state_.knownInlierFactorIndices.end());
+    gncParams.setKnownInliers(knownInliers);
+
+    gtsam::GncOptimizer<GncParams> gnc(state_.graphFG, state_.graphValues, gncParams);
+
+    const auto optimalValues = gnc.optimize();
+
+    const double errEnd1  = state_.graphFG.error(optimalValues);
+    const double rmseEnd1 = std::sqrt(errEnd1 * N_1);
+
+    // Log GNC weights for LC edges (for diagnostics)
+    const auto& gncWeights    = gnc.getWeights();
+    size_t      numLcOutliers = 0;
+    size_t      numLcInliers  = 0;
+    for (size_t k = 0; k < static_cast<size_t>(gncWeights.size()); k++)
+    {
+        // Check if this factor is NOT a known inlier (i.e., it's an LC edge)
+        const bool isKnownInlier = std::binary_search(
+            state_.knownInlierFactorIndices.begin(), state_.knownInlierFactorIndices.end(), k);
+        if (!isKnownInlier)
+        {
+            if (gncWeights[static_cast<Eigen::Index>(k)] < 0.5)
+            {
+                numLcOutliers++;
+            }
+            else
+            {
+                numLcInliers++;
+            }
+        }
+    }
     MRPT_LOG_INFO_STREAM(
-        "GNC result: " << result.numLcInliers << " LC inlier(s), " << result.numLcOutliers
+        "GNC result: " << numLcInliers << " LC inlier(s), " << numLcOutliers
                        << " LC outlier(s) rejected");
 
-    state_.graphValues = result.values;
+    // Compute largest pose change
+    double largestDelta = 0.0;
+    using gtsam::symbol_shorthand::X;
 
-    // Recompute combined FG for marginals (same as in run_gnc)
-    gtsam::NonlinearFactorGraph combined = state_.graphFG;
-    if (!state_.planarityFG.empty())
+    for (size_t i = 0; i < state_.sm->size(); i++)
     {
-        combined.add(state_.planarityFG);
-    }
-    state_.graphMarginals.emplace(combined, state_.graphValues);
+        const auto newPose = mrpt::gtsam_wrappers::toTPose3D(optimalValues.at<gtsam::Pose3>(X(i)));
+        const auto oldPose =
+            mrpt::gtsam_wrappers::toTPose3D(state_.graphValues.at<gtsam::Pose3>(X(i)));
 
+        const double delta = mrpt::poses::CPose3D(oldPose - newPose).translation().norm();
+        mrpt::keep_max(largestDelta, delta);
+    }
+
+    // Save new optimal values
+    state_.graphValues = optimalValues;
+
+    // Compute marginals:
+    state_.graphMarginals.emplace(state_.graphFG, state_.graphValues);
+
+    // Logging:
     auto bckCol =
         mrpt::system::COutputLogger::logging_levels_to_colors().at(mrpt::system::LVL_INFO);
     mrpt::system::COutputLogger::logging_levels_to_colors().at(mrpt::system::LVL_INFO) =
         mrpt::system::ConsoleForegroundColor::BRIGHT_GREEN;
+
     MRPT_LOG_INFO_STREAM(
-        "Graph optimized (GNC): RMSE " << result.rmseInit << " -> " << result.rmseEnd
-                                       << ", largest delta: " << result.largestDelta << " m");
+        "Graph optimized (GNC): RMSE " << rmseInit1 << " -> " << rmseEnd1
+                                       << ", largest delta: " << largestDelta << " m");
+
     mrpt::system::COutputLogger::logging_levels_to_colors().at(mrpt::system::LVL_INFO) = bckCol;
 
-    return result.largestDelta;
+    return largestDelta;
 }
 
 mrpt::poses::CPose3D FrameToFrameLoopClosure::frame_pose_in_simplemap(frame_id_t frameId) const
@@ -1516,13 +1408,6 @@ void FrameToFrameLoopClosure::save_3d_scene_files(const std::string& suffix) con
     }
 }
 
-void FrameToFrameLoopClosure::build_planarity_factors(double sigmaZ, double sigmaAng)
-{
-    ASSERT_(state_.sm);
-    lc_common::build_planarity_factors(
-        state_.planarityFG, state_.graphValues, state_.sm->size(), sigmaZ, sigmaAng);
-}
-
 void FrameToFrameLoopClosure::save_trajectory_as_tum(
     const std::string& filename, bool saveCovariancesToo) const
 {
@@ -1534,6 +1419,7 @@ void FrameToFrameLoopClosure::save_trajectory_as_tum(
     if (saveCovariancesToo)
     {
         ASSERT_(state_.graphMarginals.has_value());
+        pathSigmas.setZero(state_.sm->size(), 6);
     }
 
     for (size_t id = 0; id < state_.sm->size(); id++)
@@ -1554,11 +1440,9 @@ void FrameToFrameLoopClosure::save_trajectory_as_tum(
         {
             const auto& cov = state_.get_pose_cov(id);
 
-            const auto row = static_cast<Eigen::Index>(path.size() - 1);
-            pathSigmas.conservativeResize(row + 1, 6);
             for (int i = 0; i < 6; i++)
             {
-                pathSigmas(row, i) = std::sqrt(cov(i, i));
+                pathSigmas(id, i) = std::sqrt(cov(i, i));
             }
         }
     }
