@@ -36,14 +36,26 @@ params:
   largest_delta_for_reconsider_all: 10.0 # [m]
 
   use_gnss: "${USE_GNSS|true}"
+  gnss_max_uncertainty_horiz: ${LC_GNSS_MAX_UNCERTAINTY_HORIZ|20.0} # [m] Reject reading if horizontal uncertainty > this
+  gnss_max_uncertainty_vert: ${LC_GNSS_MAX_UNCERTAINTY_VERT|40.0} # [m] Reject reading if vertical uncertainty > this
   gnss_edges_uncertainty_multiplier: "${GNSS_EDGES_UNCERTAINTY_MULTIPLIER|true}"
 
+  # IMU-derived gravity-alignment factors (added in stage 1, alongside GNSS).
+  use_imu_gravity: true
+  imu_gravity_sigma_deg: 3.0
+
+  # Sigmas for the submap-graph odometry edges used in Dijkstra candidate search.
+  # Defaults match the legacy hard-coded values [m, m, m, rad, rad, rad].
+  # submap_graph_edge_sigmas: [0.10, 0.10, 0.15, 0.01745, 0.02618, 0.01745]
+
   assume_planar_world: false
+  # planar_world_initial_sigma_z: 0.10
+  # planar_world_initial_sigma_ang: 0.02
+  # planar_world_annealing_rounds: 2
+  # planar_world_hard_flatten: false
 
   # Minimum ICP quality to accept a loop closure:
   min_icp_goodness: "${LC_MIN_ICP_QUALITY|0.55}"
-  icp_edge_worst_multiplier: 3.0 # how much uncertainty for the "min_icp_goodness" in comparison to a 100% icp result
-  icp_edge_robust_param: ${MOLA_LC_ICP_EDGE_ROBUST_PARAMETER|10.0}
 
   icp_edge_additional_noise_xyz: 0.01 # [m]
   icp_edge_additional_noise_ang_deg: 0.05 # [deg]
@@ -79,6 +91,9 @@ icp_settings:
     maxIterations: 800
     minAbsStep_trans: 1e-4
     minAbsStep_rot: 5e-5
+
+    # Important: Evaluate quality as ratio of matched pairs using the FINAL annealing-like adaptive threshold.
+    force_final_pairings_for_quality: true
 
     quality_checkpoints:
       - iteration: 150
