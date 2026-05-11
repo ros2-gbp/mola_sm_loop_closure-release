@@ -21,9 +21,13 @@
 #include <mola_gtsam_factors/FactorGnssEnu.h>
 #include <mola_gtsam_factors/gtsam_detect_version.h>
 #include <mola_sm_loop_closure/FrameToFrameLoopClosure.h>
+#include <mola_sm_loop_closure/common/debug_flags.h>
 #include <mola_sm_loop_closure/common/gnc_optimizer.h>
+#include <mola_sm_loop_closure/common/gnss_factor_helpers.h>
+#include <mola_sm_loop_closure/common/icp_pipeline_setup.h>
 #include <mola_sm_loop_closure/common/obs_helpers.h>
 #include <mola_sm_loop_closure/common/planarity_factors.h>
+#include <mola_sm_loop_closure/common/tum_writer.h>
 #include <mola_yaml/yaml_helpers.h>
 #include <mp2p_icp/update_velocity_buffer_from_obs.h>
 #include <mrpt/core/get_env.h>
@@ -34,15 +38,25 @@
 #include <mrpt/obs/CObservationGPS.h>
 #include <mrpt/obs/CObservationPointCloud.h>
 #include <mrpt/obs/CObservationVelodyneScan.h>
+#include <mrpt/opengl/CGridPlaneXY.h>
 #include <mrpt/opengl/CPointCloud.h>
 #include <mrpt/opengl/CSetOfLines.h>
 #include <mrpt/opengl/Scene.h>
+#include <mrpt/opengl/Viewport.h>
+#include <mrpt/opengl/opengl_fonts.h>
 #include <mrpt/poses/CPose3DInterpolator.h>
 #include <mrpt/poses/Lie/SO.h>
 #include <mrpt/poses/gtsam_wrappers.h>
 #include <mrpt/system/filesystem.h>
 
+#ifdef MOLA_HAS_KISS_MATCHER
+#include <kiss_matcher/KISSMatcher.hpp>
+#endif
+
+#include <cerrno>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
 
 using namespace mola;
 
@@ -50,8 +64,9 @@ IMPLEMENTS_SERIALIZABLE(FrameToFrameLoopClosure, LoopClosureInterface, mola)
 
 namespace
 {
-const bool PRINT_LC_SCORES = mrpt::get_env<bool>("PRINT_LC_SCORES", false);
-const bool SAVE_ICP_LOGS   = mrpt::get_env<bool>("SAVE_ICP_LOGS", false);
+// Convenience shortcuts to the shared debug-flag singleton.
+#define PRINT_LC_SCORES (mola::lc_common::DebugFlags::instance().print_lc_scores)
+#define SAVE_ICP_LOGS (mola::lc_common::DebugFlags::instance().save_icp_logs)
 
 using mola::lc_common::frame_has_mapping_observations;
 
@@ -82,41 +97,82 @@ double score_stratified(
     return 0.6 * proximityScore + 0.4 * separationScore;
 }
 
-/**
- * Compute score using multi-objective strategy
+/** Input arguments for score_multi_objective(). Grouped into a struct to
+ *  avoid a long parameter list and to make call sites self-documenting.
  */
-double score_multi_objective(
-    double distance, [[maybe_unused]] double minDist, [[maybe_unused]] double maxDist,
-    size_t frameI, size_t frameJ, size_t totalFrames, const std::vector<double>& selectedDistances,
-    double wProx, double wSep, double wDiv, double wCov)
+struct MultiObjectiveArgs
+{
+    // Candidate being scored
+    double               distance;  // inter-frame distance [m]
+    size_t               frameI;
+    size_t               frameJ;
+    size_t               totalFrames;
+    mrpt::math::TPoint3D spatialMidpoint;  // (pose_i + pose_j) / 2
+
+    // Accumulators updated by the greedy selection loop
+    const std::vector<double>*               selectedDistances;  // objective 3
+    const std::vector<mrpt::math::TPoint3D>* selectedMidpoints;  // objective 4
+
+    // Weights (need not sum to 1; they are normalized internally)
+    double wProx;
+    double wSep;
+    double wDiv;
+    double wCov;
+};
+
+/**
+ * Compute score using multi-objective strategy.
+ *
+ * Objectives:
+ *  1. Proximity     -- prefer spatially close keyframe pairs.
+ *  2. Frame sep.    -- prefer temporally distant pairs.
+ *  3. Dist. diversity -- penalize pairs whose inter-frame distance is already
+ *                        well-represented in the selected set.
+ *  4. Spatial coverage -- penalize pairs whose geometric midpoint falls near
+ *                         already-selected midpoints, so the set covers
+ *                         different map areas.
+ */
+double score_multi_objective(const MultiObjectiveArgs& a)
 {
     // 1. Proximity score
-    const double proximityScore = 1.0 / (1.0 + distance);
+    const double proximityScore = 1.0 / (1.0 + a.distance);
 
     // 2. Frame separation score
-    const auto   frameSep        = static_cast<double>(frameJ - frameI);
-    const auto   maxFrameSep     = static_cast<double>(totalFrames);
+    const auto   frameSep        = static_cast<double>(a.frameJ - a.frameI);
+    const auto   maxFrameSep     = static_cast<double>(a.totalFrames);
     const double separationScore = frameSep / maxFrameSep;
 
-    // 3. Distance diversity score
+    // 3. Distance diversity: penalize inter-frame distances similar to those
+    //    already selected. Characteristic scale: 5 m.
     double diversityScore = 1.0;
-    for (const auto existingDist : selectedDistances)
+    for (const double existingDist : *a.selectedDistances)
     {
-        const double distDiff = std::abs(distance - existingDist);
-        const double penalty  = std::exp(-distDiff / 5.0);  // 5m characteristic scale
+        const double distDiff = std::abs(a.distance - existingDist);
+        const double penalty  = std::exp(-distDiff / 5.0);
         diversityScore *= (1.0 - 0.3 * penalty);
     }
 
-    // 4. Geometric coverage score (trajectory mid-point coverage)
-    const double midPoint      = static_cast<double>(frameI + frameJ) / 2.0;
-    const double coverageScore = std::abs(std::sin(M_PI * midPoint / maxFrameSep));
+    // 4. Spatial coverage: penalize candidates whose geometric midpoint is
+    //    close to an already-selected midpoint, encouraging the set to cover
+    //    different map areas. Characteristic scale: 20 m.
+    //    Score is 1.0 when no candidates have been selected yet.
+    double coverageScore = 1.0;
+    for (const auto& existingMidpt : *a.selectedMidpoints)
+    {
+        const double dx      = a.spatialMidpoint.x - existingMidpt.x;
+        const double dy      = a.spatialMidpoint.y - existingMidpt.y;
+        const double dz      = a.spatialMidpoint.z - existingMidpt.z;
+        const double midDist = std::sqrt(dx * dx + dy * dy + dz * dz);
+        const double penalty = std::exp(-midDist / 20.0);
+        coverageScore *= (1.0 - 0.5 * penalty);
+    }
 
-    // Normalize weights (in case they don't sum to 1.0)
-    const double wSum = wProx + wSep + wDiv + wCov;
-    const double w1   = wProx / wSum;
-    const double w2   = wSep / wSum;
-    const double w3   = wDiv / wSum;
-    const double w4   = wCov / wSum;
+    // Normalize weights in case they do not sum to 1.0.
+    const double wSum = a.wProx + a.wSep + a.wDiv + a.wCov;
+    const double w1   = a.wProx / wSum;
+    const double w2   = a.wSep / wSum;
+    const double w3   = a.wDiv / wSum;
+    const double w4   = a.wCov / wSum;
 
     return w1 * proximityScore + w2 * separationScore + w3 * diversityScore + w4 * coverageScore;
 }
@@ -164,8 +220,10 @@ void FrameToFrameLoopClosure::initialize(const mrpt::containers::yaml& c)
     YAML_LOAD_OPT(params_, use_gnss, bool);
     YAML_LOAD_OPT(params_, gnss_minimum_uncertainty_xyz, double);
     YAML_LOAD_OPT(params_, gnss_add_horizontality, bool);
-    YAML_LOAD_OPT(params_, gnss_horizontality_sigma_z, double);
+    YAML_LOAD_OPT(params_, gnss_horizontality_sigma_rpy, double);
     YAML_LOAD_OPT(params_, gnss_edges_uncertainty_multiplier, double);
+    YAML_LOAD_OPT(params_, gnss_max_uncertainty_horiz, double);
+    YAML_LOAD_OPT(params_, gnss_max_uncertainty_vert, double);
 
     YAML_LOAD_OPT(params_, min_distance_between_frames, double);
     YAML_LOAD_OPT(params_, max_distance_for_lc_candidate, double);
@@ -222,6 +280,10 @@ void FrameToFrameLoopClosure::initialize(const mrpt::containers::yaml& c)
     YAML_LOAD_OPT(params_, planar_world_initial_sigma_ang, double);
     YAML_LOAD_OPT(params_, planar_world_annealing_rounds, size_t);
 
+    YAML_LOAD_OPT(params_, use_kiss_matcher, bool);
+    YAML_LOAD_OPT(params_, kiss_matcher_resolution, double);
+    YAML_LOAD_OPT(params_, kiss_matcher_layer, std::string);
+
     YAML_LOAD_OPT(params_, largest_delta_for_reconsider, double);
     YAML_LOAD_OPT(params_, max_sensor_range, double);
 
@@ -232,6 +294,7 @@ void FrameToFrameLoopClosure::initialize(const mrpt::containers::yaml& c)
 
     YAML_LOAD_OPT(params_, save_3d_scene_files, bool);
     YAML_LOAD_OPT(params_, save_3d_scene_files_per_iteration, bool);
+    YAML_LOAD_OPT(params_, save_3d_scene_live_preview, bool);
     YAML_LOAD_OPT(params_, scene_path_line_width, float);
     YAML_LOAD_OPT(params_, scene_lc_line_width, float);
     YAML_LOAD_OPT(params_, scene_path_color_r, float);
@@ -242,6 +305,10 @@ void FrameToFrameLoopClosure::initialize(const mrpt::containers::yaml& c)
     YAML_LOAD_OPT(params_, scene_lc_color_g, float);
     YAML_LOAD_OPT(params_, scene_lc_color_b, float);
     YAML_LOAD_OPT(params_, scene_lc_color_a, float);
+    YAML_LOAD_OPT(params_, scene_lc_candidate_color_r, float);
+    YAML_LOAD_OPT(params_, scene_lc_candidate_color_g, float);
+    YAML_LOAD_OPT(params_, scene_lc_candidate_color_b, float);
+    YAML_LOAD_OPT(params_, scene_lc_candidate_color_a, float);
     YAML_LOAD_OPT(params_, scene_keyframe_point_size, float);
 
     // Load manual loop closure hints
@@ -262,6 +329,8 @@ void FrameToFrameLoopClosure::initialize(const mrpt::containers::yaml& c)
             mlc.timestamp_i = entry.at("timestamp_i").as<double>();
             mlc.timestamp_j = entry.at("timestamp_j").as<double>();
             mlc.sigma_xyz   = entry.at("sigma_xyz").as<double>();
+            if (entry.count("trust_as_inlier") != 0)
+                mlc.trust_as_inlier = entry.at("trust_as_inlier").as<bool>();
 
             params_.manual_loop_constraints.push_back(mlc);
         }
@@ -273,36 +342,10 @@ void FrameToFrameLoopClosure::initialize(const mrpt::containers::yaml& c)
     profiler_.enable(params_.profiler_enabled);
 
     // Initialize ICP pipelines for each thread
-    ENSURE_YAML_ENTRY_EXISTS(c, "icp_settings");
-
     for (auto& pts : state_.perThreadState_)
     {
-        const auto [icp, icpParams] = mp2p_icp::icp_pipeline_from_yaml(c["icp_settings"]);
-        pts.icp                     = icp;
-        params_.icp_parameters      = icpParams;
-
-        pts.icp->attachToParameterSource(pts.parameter_source);
-
-        // Observation generators
-        if (c.has("observations_generator") && !c["observations_generator"].isNullNode())
-        {
-            pts.obs_generators =
-                mp2p_icp_filters::generators_from_yaml(c["observations_generator"]);
-        }
-        else
-        {
-            auto defaultGen = mp2p_icp_filters::Generator::Create();
-            defaultGen->initialize({});
-            pts.obs_generators.push_back(defaultGen);
-        }
-        mp2p_icp::AttachToParameterSource(pts.obs_generators, pts.parameter_source);
-
-        // Observation filters
-        if (c.has("observations_filter"))
-        {
-            pts.pc_filter = mp2p_icp_filters::filter_pipeline_from_yaml(c["observations_filter"]);
-            mp2p_icp::AttachToParameterSource(pts.pc_filter, pts.parameter_source);
-        }
+        params_.icp_parameters = lc_common::load_icp_pipeline_from_yaml(
+            c, pts.pipeline, params_.threshold_sigma_initial, params_.threshold_sigma_final);
     }
 
 #if MP2P_ICP_HAS_LOG_FUNCTOR  // MP2P_ICP>=2.6.0
@@ -313,6 +356,26 @@ void FrameToFrameLoopClosure::initialize(const mrpt::containers::yaml& c)
         return params_.icp_parameters.generateDebugFiles &&
                log.icpResult.quality >= params_.min_icp_goodness_to_save_icplog;
     };
+#endif
+
+#ifdef MOLA_HAS_KISS_MATCHER
+    if (params_.use_kiss_matcher)
+    {
+        const kiss_matcher::KISSMatcherConfig km_cfg(
+            static_cast<float>(params_.kiss_matcher_resolution));
+        for (auto& pts : state_.perThreadState_)
+            pts.kissMatcher = std::make_shared<kiss_matcher::KISSMatcher>(km_cfg);
+        MRPT_LOG_INFO_STREAM(
+            "KISS-Matcher enabled: resolution=" << params_.kiss_matcher_resolution << " m, layer='"
+                                                << params_.kiss_matcher_layer << "'");
+    }
+#else
+    if (params_.use_kiss_matcher)
+    {
+        MRPT_LOG_WARN(
+            "use_kiss_matcher=true but this build lacks KISS-Matcher support "
+            "(populate the third_party/kiss-matcher submodule and rebuild); ignoring.");
+    }
 #endif
 
     state_.initialized = true;
@@ -412,7 +475,9 @@ void FrameToFrameLoopClosure::process(mrpt::maps::CSimpleMap& sm)  // NOLINT
     }
 
     // Loop closure detection and optimization
-    size_t                                      accepted_lcs = 0;
+    size_t                                      accepted_lcs    = 0;
+    size_t                                      lastGncInliers  = 0;
+    size_t                                      lastGncOutliers = 0;
     std::set<std::pair<frame_id_t, frame_id_t>> alreadyChecked;
 
     for (size_t lcRound = 0; lcRound < params_.max_lc_optimization_rounds; lcRound++)
@@ -473,8 +538,26 @@ void FrameToFrameLoopClosure::process(mrpt::maps::CSimpleMap& sm)  // NOLINT
         const auto frameGroup           = static_cast<double>(params_.min_frames_between_lc);
         size_t     acceptedSinceLastOpt = 0;
 
-        for (const auto& lc : candidates)
+        LivePreviewStats liveStats;
+        liveStats.lcRound         = lcRound;
+        liveStats.totalRounds     = params_.max_lc_optimization_rounds;
+        liveStats.acceptedLCs     = accepted_lcs;
+        liveStats.candidatesTotal = candidates.size();
+        liveStats.candidatesDone  = 0;
+        // Carry forward GNC stats from previous rounds so the live preview
+        // caption does not reset to "0 inliers, 0 outliers" at each round start.
+        liveStats.gncInliers  = lastGncInliers;
+        liveStats.gncOutliers = lastGncOutliers;
+
+        if (params_.save_3d_scene_live_preview)
         {
+            save_3d_scene_live_preview(candidates, liveStats);
+        }
+
+        for (size_t ci = 0; ci < candidates.size(); ci++)
+        {
+            const auto& lc = candidates[ci];
+
             // Decimate the frame IDs so we are effectively counting "blocks" of frames for what
             // concerns already-checked:
             const auto frameGroup_i = mrpt::round(static_cast<double>(lc.frame_i) / frameGroup);
@@ -491,13 +574,23 @@ void FrameToFrameLoopClosure::process(mrpt::maps::CSimpleMap& sm)  // NOLINT
 
             alreadyChecked.insert(IDs);
             checkedCount++;
+            liveStats.candidatesDone = checkedCount;
 
-            const bool accepted = process_loop_candidate(lc);
-            if (accepted)
+            const auto lc_result = process_loop_candidate(lc);
+            if (lc_result.has_value())
             {
                 anyGraphChange = true;
                 accepted_lcs++;
                 acceptedSinceLastOpt++;
+
+                if (params_.save_3d_scene_live_preview)
+                {
+                    const std::vector<LoopCandidate> remaining(
+                        candidates.begin() + ci + 1, candidates.end());
+                    liveStats.acceptedLCs    = accepted_lcs;
+                    liveStats.candidatesDone = checkedCount;
+                    save_3d_scene_live_preview(remaining, liveStats);
+                }
 
                 // Intermediate optimization: re-optimize after every N accepted LCs
                 // so that later (larger-gap) candidates benefit from corrected poses.
@@ -507,8 +600,23 @@ void FrameToFrameLoopClosure::process(mrpt::maps::CSimpleMap& sm)  // NOLINT
                     MRPT_LOG_INFO_STREAM(
                         "Intermediate optimization after " << acceptedSinceLastOpt
                                                            << " accepted LCs");
-                    optimize_graph();
+                    {
+                        const auto optRes     = optimize_graph();
+                        liveStats.gncInliers  = optRes.numLcInliers;
+                        liveStats.gncOutliers = optRes.numLcOutliers;
+                        lastGncInliers        = optRes.numLcInliers;
+                        lastGncOutliers       = optRes.numLcOutliers;
+                    }
                     acceptedSinceLastOpt = 0;
+
+                    if (params_.save_3d_scene_live_preview)
+                    {
+                        const std::vector<LoopCandidate> remaining(
+                            candidates.begin() + ci + 1, candidates.end());
+                        liveStats.acceptedLCs    = accepted_lcs;
+                        liveStats.candidatesDone = checkedCount;
+                        save_3d_scene_live_preview(remaining, liveStats);
+                    }
                 }
             }
         }
@@ -521,7 +629,12 @@ void FrameToFrameLoopClosure::process(mrpt::maps::CSimpleMap& sm)  // NOLINT
         if (anyGraphChange && acceptedSinceLastOpt > 0)
         {
             // Final optimization for remaining accepted LCs in this round
-            const double largestDelta = optimize_graph();
+            const auto   optRes       = optimize_graph();
+            const double largestDelta = optRes.largestDelta;
+            liveStats.gncInliers      = optRes.numLcInliers;
+            liveStats.gncOutliers     = optRes.numLcOutliers;
+            lastGncInliers            = optRes.numLcInliers;
+            lastGncOutliers           = optRes.numLcOutliers;
 
             if (params_.save_3d_scene_files && params_.save_3d_scene_files_per_iteration)
             {
@@ -536,9 +649,19 @@ void FrameToFrameLoopClosure::process(mrpt::maps::CSimpleMap& sm)  // NOLINT
                 alreadyChecked.clear();
             }
         }
+
+        if (params_.save_3d_scene_live_preview && checkedCount > 0)
+        {
+            liveStats.acceptedLCs    = accepted_lcs;
+            liveStats.candidatesDone = checkedCount;
+            save_3d_scene_live_preview({}, liveStats);
+        }
     }
 
-    MRPT_LOG_INFO_STREAM("Total accepted loop closures: " << accepted_lcs);
+    MRPT_LOG_INFO_STREAM(
+        "Total accepted loop closures: " << accepted_lcs << " (GNC: " << lastGncInliers
+                                         << " inliers, " << lastGncOutliers
+                                         << " outliers rejected)");
 
     if (params_.save_trajectory_files)
     {
@@ -551,6 +674,7 @@ void FrameToFrameLoopClosure::process(mrpt::maps::CSimpleMap& sm)  // NOLINT
     }
 
     // Update simplemap with optimized poses
+    using gtsam::symbol_shorthand::X;
     mrpt::maps::CSimpleMap outSM;
     for (size_t id = 0; id < sm.size(); id++)
     {
@@ -558,7 +682,25 @@ void FrameToFrameLoopClosure::process(mrpt::maps::CSimpleMap& sm)  // NOLINT
 
         const auto newPose = mrpt::poses::CPose3DPDFGaussian::Create();
         newPose->mean      = state_.get_pose(id);
-        newPose->cov.setIdentity();
+        if (state_.graphMarginals.has_value())
+        {
+            try
+            {
+                newPose->cov = mrpt::gtsam_wrappers::to_mrpt_se3_cov6(
+                    state_.graphMarginals->marginalCovariance(X(id)));
+            }
+            catch (const std::exception& e)
+            {
+                MRPT_LOG_WARN_STREAM(
+                    "[f2f_lc] Marginal covariance unavailable for frame " << id << ": "
+                                                                          << e.what());
+                newPose->cov.setIdentity();
+            }
+        }
+        else
+        {
+            newPose->cov.setIdentity();
+        }
 
         outSM.insert(newPose, sf, twist);
     }
@@ -636,61 +778,20 @@ void FrameToFrameLoopClosure::build_initial_graph()
 
 void FrameToFrameLoopClosure::add_gnss_factors()
 {
-    using gtsam::symbol_shorthand::X;
-
     mrpt::system::CTimeLoggerEntry tle(profiler_, "add_gnss_factors");
 
     ASSERT_(state_.sm);
-    const auto& sm = *state_.sm;
 
-    // Extract GNSS frames
-    AddGNSSFactorParams gpsParams;
-    gpsParams.minimumUncertaintyXYZ       = params_.gnss_minimum_uncertainty_xyz;
-    gpsParams.addHorizontalityConstraints = params_.gnss_add_horizontality;
-    gpsParams.horizontalitySigmaZ         = params_.gnss_horizontality_sigma_z;
+    lc_common::GnssFactorParams p;
+    p.add_horizontality       = params_.gnss_add_horizontality;
+    p.horizontality_sigma_rpy = params_.gnss_horizontality_sigma_rpy;
+    p.minimum_uncertainty_xyz = params_.gnss_minimum_uncertainty_xyz;
+    p.uncertainty_multiplier  = params_.gnss_edges_uncertainty_multiplier;
+    p.max_uncertainty_horiz   = params_.gnss_max_uncertainty_horiz;
+    p.max_uncertainty_vert    = params_.gnss_max_uncertainty_vert;
 
-    const auto gnssFrames = extract_gnss_frames_from_sm(sm, state_.globalGeoRef);
-
-    if (gnssFrames.frames.empty())
-    {
-        MRPT_LOG_WARN("No valid GNSS observations found");
-        return;
-    }
-
-    if (!state_.globalGeoRef.has_value())
-    {
-        state_.globalGeoRef = gnssFrames.refCoord;
-    }
-
-    MRPT_LOG_INFO_STREAM("Adding " << gnssFrames.frames.size() << " GNSS factors");
-
-    // Add GNSS factors for each frame
-    for (const auto& gf : gnssFrames.frames)
-    {
-        // kf_index is already set by extract_gnss_frames_from_sm
-        const frame_id_t frameId = static_cast<frame_id_t>(gf.kf_index);
-        if (frameId >= static_cast<frame_id_t>(sm.size()))
-        {
-            continue;
-        }
-
-        auto noiseOrg = gtsam::noiseModel::Diagonal::Sigmas(
-            gtsam::Vector3(gf.sigma_E, gf.sigma_N, gf.sigma_U)
-                .array()
-                .max(params_.gnss_minimum_uncertainty_xyz) *
-            params_.gnss_edges_uncertainty_multiplier);
-
-        auto robustNoise = gtsam::noiseModel::Robust::Create(
-            gtsam::noiseModel::mEstimator::Huber::Create(1.5), noiseOrg);
-
-        const auto observedENU = mrpt::gtsam_wrappers::toPoint3(gf.enu);
-        const auto sensorPointOnVeh =
-            mrpt::gtsam_wrappers::toPoint3(gf.obs->sensorPose.translation());
-
-        state_.knownInlierFactorIndices.push_back(state_.graphFG.size());
-        state_.graphFG.emplace_shared<mola::factors::FactorGnssEnu>(
-            X(frameId), sensorPointOnVeh, observedENU, robustNoise);
-    }
+    lc_common::add_gnss_factors_per_kf(
+        state_.graphFG, *state_.sm, state_.globalGeoRef, p, state_.knownInlierFactorIndices, this);
 }
 
 void FrameToFrameLoopClosure::add_manual_loop_closure_factors()
@@ -774,7 +875,39 @@ void FrameToFrameLoopClosure::add_manual_loop_closure_factors()
             continue;
         }
 
-        // Relative pose: identity since we are assuming this is roughly a loop-closure:
+#ifdef MOLA_HAS_KISS_MATCHER
+        // When KISS-Matcher is available, use it (+ ICP) to compute the actual
+        // relative pose rather than assuming an identity transform.
+        if (params_.use_kiss_matcher)
+        {
+            LoopCandidate lc;
+            lc.frame_i = fi;
+            lc.frame_j = fj;
+            lc.distance =
+                (state_.get_pose(fi).translation() - state_.get_pose(fj).translation()).norm();
+            lc.score = 1.0;
+
+            if (const auto km_result = process_loop_candidate(lc); km_result.has_value())
+            {
+                if (mlc.trust_as_inlier) state_.knownInlierFactorIndices.push_back(*km_result);
+                addedCount++;
+                MRPT_LOG_INFO_STREAM(
+                    "Manual LC (KISS-Matcher+ICP) added: frame "
+                    << fi << " (t=" << mlc.timestamp_i << ") <-> frame " << fj
+                    << " (t=" << mlc.timestamp_j << ")");
+                continue;
+            }
+            MRPT_LOG_WARN_STREAM(
+                "Manual LC: KISS-Matcher+ICP failed for frames "
+                << fi << "<->" << fj
+                << " (ICP quality too low); falling back to identity constraint "
+                   "with sigma_xyz="
+                << mlc.sigma_xyz << " m");
+        }
+#endif
+
+        // Fallback (or when KISS-Matcher is disabled): identity pose constraint
+        // with a tight XYZ sigma and unconstrained angles.
         const auto deltaPose = gtsam::Pose3::Identity();
 
         // Tight sigma on XYZ, very loose on angles (leave orientation free)
@@ -786,8 +919,7 @@ void FrameToFrameLoopClosure::add_manual_loop_closure_factors()
 
         auto edgeNoise = gtsam::noiseModel::Diagonal::Sigmas(sigmas);
 
-        // Mark as known inlier (manual constraints are trusted)
-        state_.knownInlierFactorIndices.push_back(state_.graphFG.size());
+        if (mlc.trust_as_inlier) state_.knownInlierFactorIndices.push_back(state_.graphFG.size());
 
 #if GTSAM_USES_BOOST
         auto factor = boost::make_shared<gtsam::BetweenFactor<gtsam::Pose3>>(
@@ -803,9 +935,9 @@ void FrameToFrameLoopClosure::add_manual_loop_closure_factors()
         addedCount++;
 
         MRPT_LOG_INFO_STREAM(
-            "Manual LC added: frame " << fi << " (t=" << mlc.timestamp_i << ") <-> frame " << fj
-                                      << " (t=" << mlc.timestamp_j
-                                      << ")  sigma_xyz=" << mlc.sigma_xyz << " m");
+            "Manual LC (identity) added: frame "
+            << fi << " (t=" << mlc.timestamp_i << ") <-> frame " << fj << " (t=" << mlc.timestamp_j
+            << ")  sigma_xyz=" << mlc.sigma_xyz << " m");
     }
 
     MRPT_LOG_INFO_STREAM("Added " << addedCount << " manual loop closure factor(s).");
@@ -825,8 +957,10 @@ auto FrameToFrameLoopClosure::
     const double minDist    = params_.min_distance_between_frames;
     const double maxDist    = params_.max_distance_for_lc_candidate;
 
-    // For multi-objective strategy: track selected distances for diversity scoring
-    std::vector<double> selectedDistances;
+    // For multi-objective strategy: track selected distances and spatial
+    // midpoints so the greedy selection step can update scores incrementally.
+    std::vector<double>               selectedDistances;
+    std::vector<mrpt::math::TPoint3D> selectedMidpoints;
 
     // Determine if we need distance binning
     const bool useStratification =
@@ -891,6 +1025,11 @@ auto FrameToFrameLoopClosure::
             lc.frame_j  = j;
             lc.distance = distance;
 
+            // Precompute spatial midpoint (used by MULTI_OBJECTIVE coverage term).
+            const auto ti      = pose_i.translation();
+            const auto tj      = pose_j.translation();
+            lc.spatialMidpoint = {0.5 * (ti.x + tj.x), 0.5 * (ti.y + tj.y), 0.5 * (ti.z + tj.z)};
+
             // Compute score based on selected strategy
             switch (params_.lc_candidate_strategy)
             {
@@ -903,11 +1042,24 @@ auto FrameToFrameLoopClosure::
                     break;
 
                 case Parameters::CandidateSelectionStrategy::MULTI_OBJECTIVE:
-                    lc.score = score_multi_objective(
-                        distance, minDist, maxDist, i, j, sm.size(), selectedDistances,
-                        params_.lc_weight_proximity, params_.lc_weight_frame_separation,
-                        params_.lc_weight_diversity, params_.lc_weight_coverage);
+                {
+                    // selectedDistances and selectedMidpoints are empty here;
+                    // the greedy step in STEP 2 will update them and re-score.
+                    MultiObjectiveArgs args;
+                    args.distance          = distance;
+                    args.frameI            = i;
+                    args.frameJ            = j;
+                    args.totalFrames       = sm.size();
+                    args.spatialMidpoint   = lc.spatialMidpoint;
+                    args.selectedDistances = &selectedDistances;
+                    args.selectedMidpoints = &selectedMidpoints;
+                    args.wProx             = params_.lc_weight_proximity;
+                    args.wSep              = params_.lc_weight_frame_separation;
+                    args.wDiv              = params_.lc_weight_diversity;
+                    args.wCov              = params_.lc_weight_coverage;
+                    lc.score               = score_multi_objective(args);
                     break;
+                }
             }
 
             // Add to appropriate container
@@ -930,6 +1082,56 @@ auto FrameToFrameLoopClosure::
                     "Candidate: " << i << " <-> " << j << " dist=" << distance
                                   << " score=" << lc.score);
             }
+        }
+    }
+
+    // ========================================================================
+    // STEP 1b: Deduplicate by block-pair ID within this call.
+    //
+    // find_loop_candidates() filters out block-pairs already in alreadyChecked
+    // (from previous rounds), but multiple (i,j) pairs can round to the same
+    // (frameGroup_i, frameGroup_j) block and all pass that check.  If more than
+    // one such pair survives into the final candidate list, the evaluation loop
+    // in process() will skip all but the first (because it inserts the block-pair
+    // into alreadyChecked after the first evaluation).  Deduplicate here --
+    // keeping the highest-scored candidate per block pair -- so that
+    // max_lc_candidates truly reflects the number that will be evaluated.
+    {
+        auto dedup = [&frameGroup](std::vector<LoopCandidate>& vec)
+        {
+            std::map<std::pair<frame_id_t, frame_id_t>, size_t> best;  // blockPair -> index
+            for (size_t k = 0; k < vec.size(); k++)
+            {
+                const auto bg_i = static_cast<frame_id_t>(
+                    mrpt::round(static_cast<double>(vec[k].frame_i) / frameGroup));
+                const auto bg_j = static_cast<frame_id_t>(
+                    mrpt::round(static_cast<double>(vec[k].frame_j) / frameGroup));
+                const auto key = std::make_pair(std::min(bg_i, bg_j), std::max(bg_i, bg_j));
+                auto       it  = best.find(key);
+                if (it == best.end() || vec[k].score > vec[it->second].score)
+                {
+                    best[key] = k;
+                }
+            }
+            std::vector<LoopCandidate> out;
+            out.reserve(best.size());
+            for (const auto& kv : best)
+            {
+                out.push_back(vec[kv.second]);
+            }
+            vec = std::move(out);
+        };
+
+        if (useStratification)
+        {
+            for (auto& bin : binnedCandidates)
+            {
+                dedup(bin);
+            }
+        }
+        else
+        {
+            dedup(candidates);
         }
     }
 
@@ -989,10 +1191,51 @@ auto FrameToFrameLoopClosure::
             finalCandidates.begin(), finalCandidates.end(),
             [](const LoopCandidate& a, const LoopCandidate& b) { return a.score > b.score; });
     }
+    else if (
+        params_.lc_candidate_strategy == Parameters::CandidateSelectionStrategy::MULTI_OBJECTIVE)
+    {
+        // Greedy diversity-aware selection:
+        //   1. Pick the highest-scored remaining candidate.
+        //   2. Record its distance and spatial midpoint.
+        //   3. Re-score all remaining candidates so the diversity and coverage
+        //      terms now penalize already-represented distances and map areas.
+        //   4. Repeat until max_lc_candidates are chosen or none remain.
+        //
+        // Scoring all candidates upfront with empty accumulators would make
+        // the diversity and coverage objectives no-ops, so we do it here.
+        while (finalCandidates.size() < params_.max_lc_candidates && !candidates.empty())
+        {
+            auto bestIt = std::max_element(
+                candidates.begin(), candidates.end(),
+                [](const LoopCandidate& a, const LoopCandidate& b) { return a.score < b.score; });
+
+            finalCandidates.push_back(*bestIt);
+            selectedDistances.push_back(bestIt->distance);
+            selectedMidpoints.push_back(bestIt->spatialMidpoint);
+            candidates.erase(bestIt);
+
+            // Re-score remaining candidates with updated accumulators.
+            for (auto& lc : candidates)
+            {
+                MultiObjectiveArgs args;
+                args.distance          = lc.distance;
+                args.frameI            = lc.frame_i;
+                args.frameJ            = lc.frame_j;
+                args.totalFrames       = sm.size();
+                args.spatialMidpoint   = lc.spatialMidpoint;
+                args.selectedDistances = &selectedDistances;
+                args.selectedMidpoints = &selectedMidpoints;
+                args.wProx             = params_.lc_weight_proximity;
+                args.wSep              = params_.lc_weight_frame_separation;
+                args.wDiv              = params_.lc_weight_diversity;
+                args.wCov              = params_.lc_weight_coverage;
+                lc.score               = score_multi_objective(args);
+            }
+        }
+    }
     else
     {
-        // Strategy: Simple top-K selection by score
-
+        // PROXIMITY_ONLY: simple top-K selection by score.
         std::sort(
             candidates.begin(), candidates.end(),
             [](const LoopCandidate& a, const LoopCandidate& b) { return a.score > b.score; });
@@ -1047,13 +1290,15 @@ auto FrameToFrameLoopClosure::
     return finalCandidates;
 }
 
-bool FrameToFrameLoopClosure::process_loop_candidate(const LoopCandidate& lc)
+std::optional<size_t> FrameToFrameLoopClosure::process_loop_candidate(const LoopCandidate& lc)
 {
     using gtsam::symbol_shorthand::X;
 
     mrpt::system::CTimeLoggerEntry tle(profiler_, "process_loop_candidate");
 
-    const size_t threadIdx = 0;  // Use first thread for now
+    const size_t threadIdx = lc_candidate_counter_.fetch_add(1, std::memory_order_relaxed) %
+                             state_.perThreadState_.size();
+    ASSERT_(threadIdx < state_.perThreadState_.size());
 
     // Get point clouds for both frames (using LRU cache)
     auto pc_i = get_cached_pointcloud(lc.frame_i, threadIdx);
@@ -1063,21 +1308,86 @@ bool FrameToFrameLoopClosure::process_loop_candidate(const LoopCandidate& lc)
     {
         MRPT_LOG_WARN_STREAM(
             "Failed to generate point clouds for LC " << lc.frame_i << " <-> " << lc.frame_j);
-        return false;
+        return std::nullopt;
     }
 
     // Initial guess from current graph
     const auto pose_i    = state_.get_pose(lc.frame_i);
     const auto pose_j    = state_.get_pose(lc.frame_j);
-    const auto initGuess = (pose_j - pose_i).asTPose();
+    auto       initGuess = (pose_j - pose_i).asTPose();
+
+    auto& pts = state_.perThreadState_.at(threadIdx);
+
+#ifdef MOLA_HAS_KISS_MATCHER
+    if (params_.use_kiss_matcher && pts.kissMatcher != nullptr)
+    {
+        mrpt::system::CTimeLoggerEntry tle_km(profiler_, "kiss_matcher_initial_guess");
+
+        auto extractEigen = [&](const mp2p_icp::metric_map_t& pc) -> std::vector<Eigen::Vector3f>
+        {
+            std::vector<Eigen::Vector3f> out;
+            auto                         it = pc.layers.find(params_.kiss_matcher_layer);
+            if (it == pc.layers.end())
+            {
+                return out;
+            }
+            const auto ptsMap = std::dynamic_pointer_cast<mrpt::maps::CPointsMap>(it->second);
+            if (!ptsMap)
+            {
+                return out;
+            }
+            const auto& xs = ptsMap->getPointsBufferRef_x();
+            const auto& ys = ptsMap->getPointsBufferRef_y();
+            const auto& zs = ptsMap->getPointsBufferRef_z();
+            out.reserve(xs.size());
+            for (size_t k = 0; k < xs.size(); k++)
+            {
+                out.emplace_back(xs[k], ys[k], zs[k]);
+            }
+            return out;
+        };
+
+        const auto src_pts = extractEigen(*pc_j);
+        const auto tgt_pts = extractEigen(*pc_i);
+
+        if (!src_pts.empty() && !tgt_pts.empty())
+        {
+            const auto sol = static_cast<kiss_matcher::KISSMatcher*>(pts.kissMatcher.get())
+                                 ->estimate(src_pts, tgt_pts);
+            if (sol.valid)
+            {
+                mrpt::math::CMatrixDouble44 T = mrpt::math::CMatrixDouble44::Identity();
+                for (int r = 0; r < 3; r++)
+                {
+                    for (int c = 0; c < 3; c++)
+                    {
+                        T(r, c) = sol.rotation(r, c);
+                    }
+                }
+                T(0, 3)   = sol.translation(0);
+                T(1, 3)   = sol.translation(1);
+                T(2, 3)   = sol.translation(2);
+                initGuess = mrpt::poses::CPose3D(T).asTPose();
+                MRPT_LOG_DEBUG_STREAM(
+                    "KISS-Matcher valid guess for LC " << lc.frame_i << "<->" << lc.frame_j
+                                                       << " T=" << initGuess);
+            }
+            else
+            {
+                MRPT_LOG_DEBUG_STREAM(
+                    "KISS-Matcher invalid solution for LC " << lc.frame_i << "<->" << lc.frame_j
+                                                            << "; using graph-based guess");
+            }
+        }
+    }
+#endif
 
     // Run ICP
-    auto& pts = state_.perThreadState_.at(threadIdx);
 
     update_dynamic_variables(lc.frame_j, threadIdx);
 
     mp2p_icp::Results icp_result;
-    pts.icp->align(*pc_j, *pc_i, initGuess, params_.icp_parameters, icp_result);
+    pts.pipeline.icp->align(*pc_j, *pc_i, initGuess, params_.icp_parameters, icp_result);
 
     const auto poseDelta = (icp_result.optimal_tf.getMeanVal().asTPose() - initGuess);
 
@@ -1091,11 +1401,12 @@ bool FrameToFrameLoopClosure::process_loop_candidate(const LoopCandidate& lc)
 
     if (icp_result.quality < params_.min_icp_goodness)
     {
-        return false;
+        return std::nullopt;
     }
 
     // Add ICP edge to graph
-    const auto deltaPose = mrpt::gtsam_wrappers::toPose3(icp_result.optimal_tf.mean);
+    const size_t newFactorIdx = state_.graphFG.size();
+    const auto   deltaPose    = mrpt::gtsam_wrappers::toPose3(icp_result.optimal_tf.mean);
 
     gtsam::Vector6 sigmas;
     const auto     covDiag = icp_result.optimal_tf.cov.asEigen().diagonal().array().sqrt();
@@ -1116,7 +1427,7 @@ bool FrameToFrameLoopClosure::process_loop_candidate(const LoopCandidate& lc)
 
     accepted_lc_edges_.emplace_back(lc.frame_i, lc.frame_j);
 
-    return true;
+    return newFactorIdx;
 }
 
 mp2p_icp::metric_map_t::Ptr FrameToFrameLoopClosure::generate_frame_pointcloud(
@@ -1139,7 +1450,8 @@ mp2p_icp::metric_map_t::Ptr FrameToFrameLoopClosure::generate_frame_pointcloud(
     for (const auto& obs : *sf)
     {
         ASSERT_(obs);
-        mp2p_icp::update_velocity_buffer_from_obs(pts.parameter_source.localVelocityBuffer, obs);
+        mp2p_icp::update_velocity_buffer_from_obs(
+            pts.pipeline.parameter_source.localVelocityBuffer, obs);
     }
 
     update_dynamic_variables(frameId, threadIdx);
@@ -1151,7 +1463,7 @@ mp2p_icp::metric_map_t::Ptr FrameToFrameLoopClosure::generate_frame_pointcloud(
         // Generate point cloud from observations
         for (const auto& obs : *sf)
         {
-            mp2p_icp_filters::apply_generators(pts.obs_generators, *obs, *observation);
+            mp2p_icp_filters::apply_generators(pts.pipeline.obs_generators, *obs, *observation);
         }
     }
     catch (const std::exception& e)
@@ -1171,7 +1483,7 @@ mp2p_icp::metric_map_t::Ptr FrameToFrameLoopClosure::generate_frame_pointcloud(
     }
 
     // Apply filters
-    mp2p_icp_filters::apply_filter_pipeline(pts.pc_filter, *observation, profiler_);
+    mp2p_icp_filters::apply_filter_pipeline(pts.pipeline.pc_filter, *observation, profiler_);
 
     // Unload raw observation data to free RAM (only effective for externally-stored data)
     if (params_.unload_observations_after_use)
@@ -1260,11 +1572,13 @@ void FrameToFrameLoopClosure::evict_pc_cache()
     }
 }
 
-double FrameToFrameLoopClosure::optimize_graph()
+FrameToFrameLoopClosure::OptGraphResult FrameToFrameLoopClosure::optimize_graph()
 {
     mrpt::system::CTimeLoggerEntry tle(profiler_, "optimize_graph");
 
     ASSERT_(!state_.graphFG.empty());
+
+    MRPT_LOG_INFO_STREAM("Executing GNC optimization...");
 
     const auto result = lc_common::run_gnc(
         state_.graphFG, state_.planarityFG, state_.graphValues, state_.knownInlierFactorIndices,
@@ -1282,7 +1596,14 @@ double FrameToFrameLoopClosure::optimize_graph()
     {
         combined.add(state_.planarityFG);
     }
-    state_.graphMarginals.emplace(combined, state_.graphValues);
+    try
+    {
+        state_.graphMarginals.emplace(combined, state_.graphValues);
+    }
+    catch (const std::exception& e)
+    {
+        MRPT_LOG_WARN_STREAM("Could not compute graph marginals: " << e.what());
+    }
 
     auto bckCol =
         mrpt::system::COutputLogger::logging_levels_to_colors().at(mrpt::system::LVL_INFO);
@@ -1293,7 +1614,7 @@ double FrameToFrameLoopClosure::optimize_graph()
                                        << ", largest delta: " << result.largestDelta << " m");
     mrpt::system::COutputLogger::logging_levels_to_colors().at(mrpt::system::LVL_INFO) = bckCol;
 
-    return result.largestDelta;
+    return {result.largestDelta, result.numLcInliers, result.numLcOutliers};
 }
 
 mrpt::poses::CPose3D FrameToFrameLoopClosure::frame_pose_in_simplemap(frame_id_t frameId) const
@@ -1322,7 +1643,7 @@ mrpt::math::CMatrixDouble66 FrameToFrameLoopClosure::State::get_pose_cov(frame_i
 void FrameToFrameLoopClosure::update_dynamic_variables(frame_id_t frameId, size_t threadIdx)
 {
     auto& pts = state_.perThreadState_.at(threadIdx);
-    auto& ps  = pts.parameter_source;
+    auto& ps  = pts.pipeline.parameter_source;
 
     const auto& [pose, sf, twist] = state_.sm->get(frameId);
 
@@ -1340,17 +1661,17 @@ void FrameToFrameLoopClosure::update_dynamic_variables(frame_id_t frameId, size_
     ps.updateVariable("wy", twistForIcp.wy);
     ps.updateVariable("wz", twistForIcp.wz);
 
-    if (!pts.expr_threshold_sigma_final.is_compiled())
+    if (!pts.pipeline.expr_threshold_sigma_final.is_compiled())
     {
-        pts.expr_threshold_sigma_final.compile(
+        pts.pipeline.expr_threshold_sigma_final.compile(
             params_.threshold_sigma_final, {}, "expr_threshold_sigma_final");
 
-        pts.expr_threshold_sigma_initial.compile(
+        pts.pipeline.expr_threshold_sigma_initial.compile(
             params_.threshold_sigma_initial, {}, "expr_threshold_sigma_initial");
     }
 
-    ps.updateVariable("SIGMA_INIT", pts.expr_threshold_sigma_initial.eval());
-    ps.updateVariable("SIGMA_FINAL", pts.expr_threshold_sigma_final.eval());
+    ps.updateVariable("SIGMA_INIT", pts.pipeline.expr_threshold_sigma_initial.eval());
+    ps.updateVariable("SIGMA_FINAL", pts.pipeline.expr_threshold_sigma_final.eval());
     ps.updateVariable("ESTIMATED_SENSOR_MAX_RANGE", params_.max_sensor_range);
 
     // This will be overwritten by the actual ICP loop later on,
@@ -1435,7 +1756,7 @@ void FrameToFrameLoopClosure::save_3d_scene_files(const std::string& suffix) con
         lines->setLineWidth(params_.scene_path_line_width);
         lines->setColor_u8(mrpt::img::TColorf(
                                params_.scene_path_color_r, params_.scene_path_color_g,
-                               params_.scene_path_color_b, params_.scene_path_color_a * 255)
+                               params_.scene_path_color_b, params_.scene_path_color_a)
                                .asTColor());
 
         for (size_t i = 1; i < sm.size(); i++)
@@ -1523,56 +1844,208 @@ void FrameToFrameLoopClosure::build_planarity_factors(double sigmaZ, double sigm
         state_.planarityFG, state_.graphValues, state_.sm->size(), sigmaZ, sigmaAng);
 }
 
+void FrameToFrameLoopClosure::save_3d_scene_live_preview(
+    const std::vector<LoopCandidate>& pendingCandidates, const LivePreviewStats& stats) const
+{
+    ASSERT_(state_.sm);
+    const auto& sm = *state_.sm;
+
+    mrpt::opengl::Scene scene;
+
+    // Ground grid spanning the trajectory bounding box
+    {
+        constexpr float GRID_SPACING = 5.0f;
+        constexpr float MARGIN       = 10.0f;
+
+        float xMin = std::numeric_limits<float>::max();
+        float xMax = -std::numeric_limits<float>::max();
+        float yMin = std::numeric_limits<float>::max();
+        float yMax = -std::numeric_limits<float>::max();
+
+        for (size_t i = 0; i < sm.size(); i++)
+        {
+            const auto p = state_.get_pose(i).translation();
+            xMin         = std::min(xMin, static_cast<float>(p.x));
+            xMax         = std::max(xMax, static_cast<float>(p.x));
+            yMin         = std::min(yMin, static_cast<float>(p.y));
+            yMax         = std::max(yMax, static_cast<float>(p.y));
+        }
+
+        // Snap outward to the nearest grid line
+        xMin = std::floor((xMin - MARGIN) / GRID_SPACING) * GRID_SPACING;
+        xMax = std::ceil((xMax + MARGIN) / GRID_SPACING) * GRID_SPACING;
+        yMin = std::floor((yMin - MARGIN) / GRID_SPACING) * GRID_SPACING;
+        yMax = std::ceil((yMax + MARGIN) / GRID_SPACING) * GRID_SPACING;
+
+        auto grid = mrpt::opengl::CGridPlaneXY::Create(xMin, xMax, yMin, yMax, 0.0f, GRID_SPACING);
+        grid->setColor(0.5f, 0.5f, 0.5f, 0.5f);
+        scene.insert(grid);
+    }
+
+    // Trajectory path edges
+    {
+        auto lines = mrpt::opengl::CSetOfLines::Create();
+        lines->setLineWidth(params_.scene_path_line_width);
+        lines->setColor_u8(mrpt::img::TColorf(
+                               params_.scene_path_color_r, params_.scene_path_color_g,
+                               params_.scene_path_color_b, params_.scene_path_color_a)
+                               .asTColor());
+        for (size_t i = 1; i < sm.size(); i++)
+        {
+            lines->appendLine(
+                state_.get_pose(i - 1).translation(), state_.get_pose(i).translation());
+        }
+        scene.insert(lines);
+    }
+
+    // Keyframe positions
+    {
+        auto pts = mrpt::opengl::CPointCloud::Create();
+        pts->setPointSize(params_.scene_keyframe_point_size);
+        pts->setColor_u8(mrpt::img::TColorf(
+                             params_.scene_path_color_r, params_.scene_path_color_g,
+                             params_.scene_path_color_b, params_.scene_path_color_a)
+                             .asTColor());
+        for (size_t i = 0; i < sm.size(); i++)
+        {
+            pts->insertPoint(state_.get_pose(i).translation());
+        }
+        scene.insert(pts);
+    }
+
+    // Accepted LC edges (green)
+    if (!accepted_lc_edges_.empty())
+    {
+        auto lines = mrpt::opengl::CSetOfLines::Create();
+        lines->setLineWidth(params_.scene_lc_line_width);
+        lines->setColor_u8(mrpt::img::TColorf(
+                               params_.scene_lc_color_r, params_.scene_lc_color_g,
+                               params_.scene_lc_color_b, params_.scene_lc_color_a)
+                               .asTColor());
+        for (const auto& [fi, fj] : accepted_lc_edges_)
+        {
+            lines->appendLine(state_.get_pose(fi).translation(), state_.get_pose(fj).translation());
+        }
+        scene.insert(lines);
+    }
+
+    // Pending candidate LC edges (orange)
+    if (!pendingCandidates.empty())
+    {
+        auto lines = mrpt::opengl::CSetOfLines::Create();
+        lines->setLineWidth(params_.scene_lc_line_width);
+        lines->setColor_u8(
+            mrpt::img::TColorf(
+                params_.scene_lc_candidate_color_r, params_.scene_lc_candidate_color_g,
+                params_.scene_lc_candidate_color_b, params_.scene_lc_candidate_color_a)
+                .asTColor());
+        for (const auto& lc : pendingCandidates)
+        {
+            lines->appendLine(
+                state_.get_pose(lc.frame_i).translation(),
+                state_.get_pose(lc.frame_j).translation());
+        }
+        scene.insert(lines);
+    }
+
+    // GPS/GNSS readings as ENU point cloud (cyan, size 3, alpha 50%)
+    size_t gnssPointCount = 0;
+    if (params_.use_gnss)
+    {
+        const auto gnssFrames = extract_gnss_frames_from_sm(*state_.sm, state_.globalGeoRef);
+        if (!gnssFrames.frames.empty())
+        {
+            auto pts = mrpt::opengl::CPointCloud::Create();
+            pts->setPointSize(3.0f);
+            pts->setColor_u8(mrpt::img::TColor(0, 220, 220, 128));  // cyan, alpha=50%
+            for (const auto& gf : gnssFrames.frames)
+            {
+                pts->insertPoint(gf.enu);
+            }
+            gnssPointCount = gnssFrames.frames.size();
+            scene.insert(pts);
+        }
+    }
+
+    // Text overlay on the main viewport
+    {
+        auto vp = scene.getViewport("main");
+
+        mrpt::opengl::TFontParams fp;
+        fp.vfont_name  = "sans";
+        fp.vfont_scale = 14.0f;
+        fp.draw_shadow = true;
+
+        fp.color = mrpt::img::TColorf(1.0f, 1.0f, 1.0f);
+        vp->addTextMessage(0.02, -20.0, "FrameToFrameLoopClosure - live preview", 0, fp);
+
+        fp.color = mrpt::img::TColorf(0.9f, 0.9f, 0.3f);
+        vp->addTextMessage(
+            0.02, -42.0, mrpt::format("LC round: %zu / %zu", stats.lcRound + 1, stats.totalRounds),
+            1, fp);
+
+        fp.color = mrpt::img::TColorf(
+            params_.scene_lc_candidate_color_r, params_.scene_lc_candidate_color_g,
+            params_.scene_lc_candidate_color_b);
+        vp->addTextMessage(
+            0.02, -64.0,
+            mrpt::format(
+                "Candidates evaluated: %zu / %zu  (pending: %zu)", stats.candidatesDone,
+                stats.candidatesTotal, pendingCandidates.size()),
+            2, fp);
+
+        fp.color = mrpt::img::TColorf(
+            params_.scene_lc_color_r, params_.scene_lc_color_g, params_.scene_lc_color_b);
+        vp->addTextMessage(
+            0.02, -86.0,
+            mrpt::format(
+                "Accepted loop closures: %zu (GNC: %zu inliers, %zu outliers rejected)",
+                stats.acceptedLCs, stats.gncInliers, stats.gncOutliers),
+            3, fp);
+
+        fp.color = mrpt::img::TColorf(0.7f, 0.7f, 0.7f);
+        vp->addTextMessage(0.02, -108.0, mrpt::format("Keyframes: %zu", sm.size()), 4, fp);
+
+        if (params_.use_gnss)
+        {
+            fp.color = mrpt::img::TColorf(0.0f, 0.86f, 0.86f);  // cyan
+            vp->addTextMessage(
+                0.02, -130.0, mrpt::format("GPS/GNSS readings (ENU): %zu", gnssPointCount), 5, fp);
+        }
+    }
+
+    const auto fn    = params_.debug_files_prefix + "live_preview.3Dscene";
+    const auto tmpFn = fn + ".tmp";
+    if (!scene.saveToFile(tmpFn))
+    {
+        MRPT_LOG_WARN_STREAM("Failed to save live preview 3D scene: " << tmpFn);
+        return;
+    }
+
+    if (::rename(tmpFn.c_str(), fn.c_str()) != 0)
+    {
+        MRPT_LOG_WARN_STREAM(
+            "Failed to atomically publish live preview scene: " << fn
+                                                                << " error=" << strerror(errno));
+    }
+}
+
 void FrameToFrameLoopClosure::save_trajectory_as_tum(
     const std::string& filename, bool saveCovariancesToo) const
 {
     ASSERT_(state_.sm);
-
-    mrpt::poses::CPose3DInterpolator path;
-    mrpt::math::CMatrixDouble        pathSigmas;
-
     if (saveCovariancesToo)
     {
         ASSERT_(state_.graphMarginals.has_value());
     }
 
-    for (size_t id = 0; id < state_.sm->size(); id++)
-    {
-        const auto& [oldPose, sf, twist] = state_.sm->get(id);
-        const auto newPose               = state_.get_pose(id);
-
-        if (sf->empty())
-        {
-            MRPT_LOG_WARN_STREAM("Frame " << id << " has no observations, skipping in trajectory");
-            continue;
-        }
-        const auto t = sf->getObservationByIndex(0)->timestamp;
-
-        path.insert(t, newPose);
-
-        if (saveCovariancesToo)
-        {
-            const auto& cov = state_.get_pose_cov(id);
-
-            const auto row = static_cast<Eigen::Index>(path.size() - 1);
-            pathSigmas.conservativeResize(row + 1, 6);
-            for (int i = 0; i < 6; i++)
-            {
-                pathSigmas(row, i) = std::sqrt(cov(i, i));
-            }
-        }
-    }
-
-    path.saveToTextFile_TUM(filename);
-
+    std::function<mrpt::math::CMatrixDouble66(size_t)> covOf;
     if (saveCovariancesToo)
     {
-        const std::string header =
-            "# sigma_x_m sigma_y_m sigma_z_m sigma_yaw_rad sigma_pitch_rad sigma_roll_rad";
-        pathSigmas.saveToTextFile(
-            mrpt::system::fileNameChangeExtension(filename, "cov"), mrpt::math::MATRIX_FORMAT_ENG,
-            false, header);
+        covOf = [this](size_t id) { return state_.get_pose_cov(id); };
     }
 
-    MRPT_LOG_INFO_STREAM("Saved trajectory to: " << filename);
+    lc_common::save_trajectory_as_tum(
+        filename, *state_.sm, [this](size_t id) { return state_.get_pose(id); },
+        saveCovariancesToo ? &covOf : nullptr, const_cast<FrameToFrameLoopClosure*>(this));
 }
