@@ -36,7 +36,17 @@ params:
   largest_delta_for_reconsider_all: 10.0 # [m]
 
   use_gnss: "${USE_GNSS|true}"
+  gnss_max_uncertainty_horiz: ${LC_GNSS_MAX_UNCERTAINTY_HORIZ|20.0} # [m] Reject reading if horizontal uncertainty > this
+  gnss_max_uncertainty_vert: ${LC_GNSS_MAX_UNCERTAINTY_VERT|40.0} # [m] Reject reading if vertical uncertainty > this
   gnss_edges_uncertainty_multiplier: "${GNSS_EDGES_UNCERTAINTY_MULTIPLIER|true}"
+
+  # IMU-derived gravity-alignment factors (added in stage 1, alongside GNSS).
+  use_imu_gravity: true
+  imu_gravity_sigma_deg: 3.0
+
+  # Sigmas for the submap-graph odometry edges used in Dijkstra candidate search.
+  # Defaults match the legacy hard-coded values [m, m, m, rad, rad, rad].
+  # submap_graph_edge_sigmas: [0.10, 0.10, 0.15, 0.01745, 0.02618, 0.01745]
 
   assume_planar_world: false
   # planar_world_initial_sigma_z: 0.10
@@ -81,6 +91,9 @@ icp_settings:
     maxIterations: 800
     minAbsStep_trans: 1e-4
     minAbsStep_rot: 5e-5
+
+    # Important: Evaluate quality as ratio of matched pairs using the FINAL annealing-like adaptive threshold.
+    force_final_pairings_for_quality: true
 
     quality_checkpoints:
       - iteration: 150
