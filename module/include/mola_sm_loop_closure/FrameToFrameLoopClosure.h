@@ -18,6 +18,7 @@
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
 #include <gtsam/nonlinear/Values.h>
 #include <mola_sm_loop_closure/LoopClosureInterface.h>
+#include <mola_sm_loop_closure/common/icp_pipeline_setup.h>
 #include <mp2p_icp/icp_pipeline_from_yaml.h>
 #include <mp2p_icp/metricmap.h>
 #include <mp2p_icp_filters/FilterBase.h>
@@ -25,11 +26,13 @@
 #include <mrpt/containers/yaml.h>
 #include <mrpt/core/WorkerThreadsPool.h>
 #include <mrpt/maps/CSimpleMap.h>
+#include <mrpt/math/TPoint3D.h>
 #include <mrpt/opengl/CSetOfObjects.h>
 #include <mrpt/system/CTimeLogger.h>
 #include <mrpt/topography/data_types.h>
 #include <mrpt/typemeta/TEnumType.h>
 
+#include <atomic>
 #include <list>
 #include <set>
 #include <unordered_map>
@@ -69,8 +72,10 @@ class FrameToFrameLoopClosure : public mola::LoopClosureInterface
         bool   use_gnss                          = true;
         double gnss_minimum_uncertainty_xyz      = 0.10;  // [m]
         bool   gnss_add_horizontality            = false;
-        double gnss_horizontality_sigma_z        = 0.01;  // [m]
+        double gnss_horizontality_sigma_rpy      = 0.01;  // [rad]
         double gnss_edges_uncertainty_multiplier = 1.0;
+        double gnss_max_uncertainty_horiz = 20.0;  // [m] reject if sqrt(sigE²+sigN²) > this
+        double gnss_max_uncertainty_vert  = 40.0;  // [m] reject if sigU > this
 
         // Loop closure candidate selection
         double min_distance_between_frames   = 20.0;  // [m] minimum separation for LC
@@ -181,17 +186,22 @@ class FrameToFrameLoopClosure : public mola::LoopClosureInterface
         // 3D scene visualization output
         bool  save_3d_scene_files               = false;
         bool  save_3d_scene_files_per_iteration = false;
+        bool  save_3d_scene_live_preview        = false;
         float scene_path_line_width             = 2.0f;
         float scene_lc_line_width               = 4.0f;
         float scene_path_color_r                = 0.0f;
         float scene_path_color_g                = 0.0f;
         float scene_path_color_b                = 1.0f;  // blue
         float scene_path_color_a                = 0.7f;
-        float scene_lc_color_r                  = 1.0f;  // red
-        float scene_lc_color_g                  = 0.0f;
+        float scene_lc_color_r                  = 0.0f;  // green (accepted)
+        float scene_lc_color_g                  = 0.9f;
         float scene_lc_color_b                  = 0.0f;
-        float scene_lc_color_a                  = 0.8f;
-        float scene_keyframe_point_size         = 7.0f;
+        float scene_lc_color_a                  = 0.9f;
+        float scene_lc_candidate_color_r        = 1.0f;  // orange (pending)
+        float scene_lc_candidate_color_g        = 0.5f;
+        float scene_lc_candidate_color_b        = 0.0f;
+        float scene_lc_candidate_color_a        = 0.7f;
+        float scene_keyframe_point_size         = 3.0f;
 
         // ===== Planar World Annealing =====
         /** If true, add planar-world constraints (z≈0, roll≈0, pitch≈0) that
@@ -202,12 +212,30 @@ class FrameToFrameLoopClosure : public mola::LoopClosureInterface
         double planar_world_initial_sigma_ang = 0.02;  // [rad] sigma at round 0 (~1 deg)
         size_t planar_world_annealing_rounds  = 2;  // rounds until constraint vanishes
 
+        // ===== KISS-Matcher initial guess =====
+        /** If true, use KISS-Matcher to compute a global-registration initial
+         *  guess before running mp2p_icp::ICP on each loop-closure candidate.
+         *  Requires the kiss-matcher git submodule to be populated. */
+        bool use_kiss_matcher = false;
+
+        /** Voxel size [m] passed to KISSMatcherConfig.  Controls feature
+         *  extraction radius (normal_radius ≈ 3×, fpfh_radius ≈ 5×). */
+        double kiss_matcher_resolution = 1.0;
+
+        /** Name of the metric-map layer extracted from each keyframe's
+         *  mp2p_icp::metric_map_t and fed into KISS-Matcher.  Must contain
+         *  an mrpt::maps::CPointsMap-derived object. */
+        std::string kiss_matcher_layer = "points_to_register_points";
+
         // ===== Manual Loop Closure Hints =====
         struct ManualLoopConstraint
         {
             double timestamp_i = 0.0;  ///< UNIX timestamp (mrpt::Clock::toDouble()) for frame i
             double timestamp_j = 0.0;  ///< UNIX timestamp (mrpt::Clock::toDouble()) for frame j
             double sigma_xyz = 0.10;  ///< [m] sigma for X, Y, Z; angles are left free (large sigma)
+            /** If true, mark this constraint as a known GNC inlier, bypassing
+             *  outlier rejection.  Use only when the constraint is highly trusted. */
+            bool trust_as_inlier = false;
         };
 
         /// List of manually specified loop closure constraints loaded from config.
@@ -223,15 +251,10 @@ class FrameToFrameLoopClosure : public mola::LoopClosureInterface
     {
         std::mutex mtx;
 
-        mp2p_icp::ParameterSource parameter_source;
-        mp2p_icp::ICP::Ptr        icp;
+        // Shared ICP pipeline (obs generators, filter, parameter source):
+        lc_common::PerThreadIcpPipeline pipeline;
 
-        // For processing observations
-        mp2p_icp_filters::GeneratorSet   obs_generators;
-        mp2p_icp_filters::FilterPipeline pc_filter;
-
-        mrpt::expr::CRuntimeCompiledExpression expr_threshold_sigma_initial;
-        mrpt::expr::CRuntimeCompiledExpression expr_threshold_sigma_final;
+        std::shared_ptr<void> kissMatcher;  // holds kiss_matcher::KISSMatcher when enabled
     };
 
     struct State
@@ -293,6 +316,9 @@ class FrameToFrameLoopClosure : public mola::LoopClosureInterface
     mrpt::system::CTimeLogger profiler_{true, "frame_to_frame_lc"};
     mrpt::WorkerThreadsPool   threads_{state_.perThreadState_.size()};
 
+    // Round-robin counter for distributing candidates across per-thread state slots.
+    std::atomic<size_t> lc_candidate_counter_{0};
+
     // Private methods
     mrpt::poses::CPose3D frame_pose_in_simplemap(frame_id_t frameId) const;
 
@@ -313,21 +339,29 @@ class FrameToFrameLoopClosure : public mola::LoopClosureInterface
 
     struct LoopCandidate
     {
-        frame_id_t frame_i  = 0;
-        frame_id_t frame_j  = 0;
-        double     distance = 0.0;  // estimated distance between frames
-        double     score    = 0.0;  // candidate quality score
+        frame_id_t           frame_i         = 0;
+        frame_id_t           frame_j         = 0;
+        double               distance        = 0.0;  // estimated distance between frames
+        double               score           = 0.0;  // candidate quality score
+        mrpt::math::TPoint3D spatialMidpoint = {0, 0, 0};  // (pose_i + pose_j) / 2
     };
 
     /** Find potential loop closure candidates */
     std::vector<LoopCandidate> find_loop_candidates(
         const std::set<std::pair<frame_id_t, frame_id_t>>& alreadyChecked) const;
 
-    /** Process a single loop closure candidate with ICP */
-    bool process_loop_candidate(const LoopCandidate& lc);
+    /** Process a single loop closure candidate with ICP.
+     *  Returns the factor index in graphFG on success, or nullopt on failure. */
+    std::optional<size_t> process_loop_candidate(const LoopCandidate& lc);
 
     /** Optimize the graph and return the largest pose change */
-    double optimize_graph();
+    struct OptGraphResult
+    {
+        double largestDelta  = 0;
+        size_t numLcInliers  = 0;
+        size_t numLcOutliers = 0;
+    };
+    OptGraphResult optimize_graph();
 
     /** Save trajectory to TUM format file */
     void save_trajectory_as_tum(const std::string& filename, bool saveCovariancesToo = false) const;
@@ -338,6 +372,24 @@ class FrameToFrameLoopClosure : public mola::LoopClosureInterface
 
     /** Save 3D scene visualization files (original poses before LC) */
     void save_3d_scene_initial_files() const;
+
+    struct LivePreviewStats
+    {
+        size_t lcRound         = 0;
+        size_t totalRounds     = 0;
+        size_t acceptedLCs     = 0;
+        size_t candidatesTotal = 0;
+        size_t candidatesDone  = 0;  ///< how many have been evaluated so far this round
+        size_t gncInliers      = 0;  ///< LC inliers from latest GNC run
+        size_t gncOutliers     = 0;  ///< LC outliers rejected by latest GNC run
+    };
+
+    /** Overwrite the single live-preview .3Dscene file.
+     *  \param pendingCandidates Candidates not yet evaluated this round (drawn in orange).
+     *  \param stats Stats displayed as text overlay.
+     *  Accepted edges are taken from accepted_lc_edges_ (drawn in green). */
+    void save_3d_scene_live_preview(
+        const std::vector<LoopCandidate>& pendingCandidates, const LivePreviewStats& stats) const;
 
     /** Update dynamic variables for ICP pipeline */
     void update_dynamic_variables(frame_id_t frameId, size_t threadIdx);
