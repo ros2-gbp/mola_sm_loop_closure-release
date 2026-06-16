@@ -40,11 +40,22 @@ if (USE_ADDRESS_SANITIZER)
 endif()
 
 include(GNUInstallDirs)
+list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(3rdparty/find_dependencies.cmake)
 include(cmake/CompilerOptions.cmake)
 
 # NOTE(hlim): Without this line, pybinded KISS-Matcher does not work
 find_library(LZ4_LIBRARY lz4 REQUIRED)
+
+# flann is consumed directly via `#include <flann/flann.hpp>` in our public
+# headers (e.g. ROBINMatching.hpp). Historically it came in as a transitive
+# include from ROBIN, but the installed ROBIN config does not propagate flann,
+# so on systems where flann is not in default search paths (e.g. Homebrew on
+# macOS at /opt/homebrew/include) the build fails. Declare it explicitly.
+# Findflann.cmake (in cmake/) tries CONFIG mode first and falls back to
+# manual discovery for distros that ship libflann-dev without a CMake config
+# (notably Ubuntu 22.04).
+find_package(flann REQUIRED)
 
 include(FindOpenMP) #The best way to set proper compiler settings for using OpenMP in all platforms
 if (OPENMP_FOUND) #The best way to set proper compiler settings for using OpenMP in all platforms
@@ -71,7 +82,7 @@ add_library(${TARGET_NAME} STATIC
 add_library(kiss_matcher::kiss_matcher_core ALIAS kiss_matcher_core)
 
 target_link_libraries(${TARGET_NAME}
-    PUBLIC Eigen3::Eigen robin::robin ${OpenMP_LIBS} ${EIGEN3_LIBS} TBB::tbb ${LZ4_LIBRARY}
+    PUBLIC Eigen3::Eigen robin::robin flann::flann_cpp ${OpenMP_LIBS} ${EIGEN3_LIBS} TBB::tbb ${LZ4_LIBRARY}
 )
 
 # To make kiss_matcher::core global for Pybinding
@@ -102,6 +113,8 @@ install(DIRECTORY core/kiss_matcher DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 export(TARGETS ${MYPROJECT_EXPORTED_TARGETS} FILE ${PROJECT_NAME}-exports.cmake)
 
-install(FILES cmake/${PROJECT_NAME}Config.cmake
+install(FILES
+    cmake/${PROJECT_NAME}Config.cmake
+    cmake/Findflann.cmake
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}
 )
