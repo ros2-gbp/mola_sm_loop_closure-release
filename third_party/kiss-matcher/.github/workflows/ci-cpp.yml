@@ -110,3 +110,113 @@ jobs:
             !build/**/*.o
             !build/**/*.obj
             !build/**/CMakeFiles/
+
+  # GitHub deprecated the `ubuntu-20.04` runner, but plenty of researchers
+  # still develop on Ubuntu 20.04. We exercise that toolchain (CMake 3.16,
+  # GCC 9, Python 3.8) inside a container running on a 22.04 host.
+  cpp-build-20-04:
+    name: C++ Build (ubuntu-20.04 container)
+    runs-on: ubuntu-22.04
+    container:
+      image: ubuntu:20.04
+    env:
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates \
+            gcc \
+            g++ \
+            build-essential \
+            libeigen3-dev \
+            cmake \
+            git \
+            ninja-build \
+            libflann-dev \
+            libtbb-dev \
+            liblz4-dev \
+            ccache
+
+      - name: Configure CMake
+        run: |
+          cmake -S cpp/kiss_matcher \
+                -B build \
+                -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+                -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+                -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+                -DUSE_SYSTEM_EIGEN3=ON \
+                -DUSE_SYSTEM_TBB=ON \
+                -DUSE_SYSTEM_ROBIN=ON
+
+      - name: Build C++ Core
+        run: cmake --build build --config Release --parallel
+
+  # AppleClang ships without OpenMP, so the macOS jobs use Homebrew LLVM
+  # clang. ROBIN is fetched (USE_SYSTEM_ROBIN=OFF) because it is not
+  # packaged on Homebrew.
+  cpp-build-macos:
+    name: C++ Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-13 (Intel) is omitted: GitHub's hosted macos-13 runners are
+        # being phased out and queue for many hours, blocking CI. macos-14
+        # is our minimum-supported Apple Silicon build (matches the wheel
+        # we publish); macos-15 catches regressions on the newest Xcode
+        # and Homebrew toolchain.
+        os: [macos-14, macos-15]
+
+    # Homebrew on the macOS runners ships CMake 4.x, which hard-errors on
+    # legacy `cmake_minimum_required(VERSION 2.x)` in transitive deps
+    # (notably PMC, fetched by ROBIN through a separate DownloadProject
+    # invocation that does not inherit the policy variable). The env var
+    # IS inherited and lets the legacy minimum continue to configure.
+    env:
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          brew update
+          brew install cmake ninja eigen tbb lz4 flann llvm libomp ccache
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ runner.os }}-ccache-cpp-${{ matrix.os }}
+          restore-keys: ${{ runner.os }}-ccache-cpp
+
+      - name: Configure CMake
+        run: |
+          LLVM_PREFIX="$(brew --prefix llvm)"
+          export CC="$LLVM_PREFIX/bin/clang"
+          export CXX="$LLVM_PREFIX/bin/clang++"
+          cmake -S cpp/kiss_matcher \
+                -B build \
+                -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_C_COMPILER="$CC" \
+                -DCMAKE_CXX_COMPILER="$CXX" \
+                -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+                -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+                -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+                -DUSE_CCACHE=ON \
+                -DUSE_SYSTEM_EIGEN3=ON \
+                -DUSE_SYSTEM_TBB=ON \
+                -DUSE_SYSTEM_ROBIN=OFF
+
+      - name: Build C++ Core
+        run: cmake --build build --config Release --parallel

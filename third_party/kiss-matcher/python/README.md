@@ -11,6 +11,11 @@
   <br />
   <p align="center"><img src="https://github.com/user-attachments/assets/763bafef-c11a-4412-a9f7-f138fc12ff9f" alt="KISS Matcher" width="80%"/></p>
   <p><strong><em>Keep it simple, make it scalable.</em></strong></p>
+  <p align="center">
+    <strong>(May 19, 2026)</strong> pip installation is now live:
+    <br/>
+    <a href="https://pypi.org/project/kiss-matcher/"><img src="https://readme-typing-svg.demolab.com?background=0D1117&color=22C55E&font=Fira+Code&size=18&duration=2500&pause=800&center=true&vCenter=true&width=300&height=30&lines=%24+pip+install+kiss-matcher" alt="pip install kiss-matcher"/></a>
+  </p>
 </div>
 
 ______________________________________________________________________
