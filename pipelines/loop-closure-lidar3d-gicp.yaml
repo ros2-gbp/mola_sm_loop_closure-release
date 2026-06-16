@@ -36,6 +36,16 @@ params:
   largest_delta_for_reconsider_all: 10.0 # [m]
 
   use_gnss: "${USE_GNSS|true}"
+  gnss_max_uncertainty_horiz: ${LC_GNSS_MAX_UNCERTAINTY_HORIZ|20.0} # [m] Reject reading if horizontal uncertainty > this
+  gnss_max_uncertainty_vert: ${LC_GNSS_MAX_UNCERTAINTY_VERT|40.0} # [m] Reject reading if vertical uncertainty > this
+
+  # IMU-derived gravity-alignment factors (added in stage 1, alongside GNSS).
+  use_imu_gravity: true
+  imu_gravity_sigma_deg: 3.0
+
+  # Sigmas for the submap-graph odometry edges used in Dijkstra candidate search.
+  # Defaults match the legacy hard-coded values [m, m, m, rad, rad, rad].
+  # submap_graph_edge_sigmas: [0.10, 0.10, 0.15, 0.01745, 0.02618, 0.01745]
 
   assume_planar_world: false
   # Planar-world annealing (opt-in): soft z/roll/pitch constraints that decay over LC rounds.
@@ -85,6 +95,9 @@ icp_settings:
     maxIterations: ${MOLA_MAX_ICP_ITERATIONS|100}
     minAbsStep_trans: 1e-3
     minAbsStep_rot: 1e-4
+
+    # Important: Evaluate quality as ratio of matched pairs using the FINAL annealing-like adaptive threshold.
+    force_final_pairings_for_quality: true
 
     quality_checkpoints:
       - iteration: 150
@@ -160,7 +173,7 @@ localmap_generator:
       # metric_map_definition_ini_file: '${CURRENT_YAML_FILE_PATH}/localmap_definition_voxelmap.ini'
 
       metric_map_definition:
-        # Any class derived from mrpt::maps::CMetricMap https://docs.mrpt.org/reference/latest/group_mrpt_maps_grp.html
+        # Any class derived from mrpt::maps::CMetricMap https://docs.mrpt.org/reference/stable/group_mrpt_maps_grp.html
         class: mola::KeyframePointCloudMap
         plugin: "libmola_metric_maps.so" # Import additional custom user-defined map classes (search in LD_LIBRARY_PATH)
         creationOpts:
@@ -184,7 +197,7 @@ localmap_generator:
       # metric_map_definition_ini_file: '${CURRENT_YAML_FILE_PATH}/localmap_definition_voxelmap.ini'
 
       metric_map_definition:
-        # Any class derived from mrpt::maps::CMetricMap https://docs.mrpt.org/reference/latest/group_mrpt_maps_grp.html
+        # Any class derived from mrpt::maps::CMetricMap https://docs.mrpt.org/reference/stable/group_mrpt_maps_grp.html
         class: mrpt::maps::CVoxelMap
         #plugin: 'libmola_metric_maps.so' # Import additional custom user-defined map classes (search in LD_LIBRARY_PATH)
         creationOpts:
@@ -208,7 +221,7 @@ localmap_generator:
       #process_sensor_labels_regex: '.*'
 
       metric_map_definition:
-        # Any class derived from mrpt::maps::CMetricMap https://docs.mrpt.org/reference/latest/group_mrpt_maps_grp.html
+        # Any class derived from mrpt::maps::CMetricMap https://docs.mrpt.org/reference/stable/group_mrpt_maps_grp.html
         class: mola::KeyframePointCloudMap
         plugin: "libmola_metric_maps.so" # Import additional custom user-defined map classes (search in LD_LIBRARY_PATH)
         creationOpts:
@@ -231,7 +244,7 @@ localmap_generator:
       #process_sensor_labels_regex: '.*'
 
       metric_map_definition:
-        # Any class derived from mrpt::maps::CMetricMap https://docs.mrpt.org/reference/latest/group_mrpt_maps_grp.html
+        # Any class derived from mrpt::maps::CMetricMap https://docs.mrpt.org/reference/stable/group_mrpt_maps_grp.html
         class: mrpt::maps::CSimplePointsMap
 
 # ---------------------------------------------------------------------------------
@@ -264,7 +277,7 @@ observations_generator:
       # metric_map_definition_ini_file: '${CURRENT_YAML_FILE_PATH}/localmap_definition_voxelmap.ini'
 
       metric_map_definition:
-        # Any class derived from mrpt::maps::CMetricMap https://docs.mrpt.org/reference/latest/group_mrpt_maps_grp.html
+        # Any class derived from mrpt::maps::CMetricMap https://docs.mrpt.org/reference/stable/group_mrpt_maps_grp.html
         class: mola::KeyframePointCloudMap
         plugin: "libmola_metric_maps.so" # Import additional custom user-defined map classes (search in LD_LIBRARY_PATH)
         creationOpts: ~ # none required
