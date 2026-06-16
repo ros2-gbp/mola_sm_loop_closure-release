@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "kiss_matcher"
-version = "1.0.0"
+version = "1.0.2"
 requires-python = ">=3.8"
 description ='Python binding for KISS-Matcher'
 authors = [
@@ -17,8 +17,7 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Operating System :: MacOS",
-    "Operating System :: Microsoft :: Windows",
-    "Operating System :: Unix",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: C++",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.6",
@@ -33,8 +32,26 @@ classifiers = [
 
 dependencies = [
   "numpy",
-  "viser",
 ]
+
+[project.optional-dependencies]
+# `viser` is only used by examples/run_kiss_matcher.py for 3D visualization.
+# It pulls in trimesh, scipy, networkx, shapely, embreex, etc. — heavy and
+# unnecessary for the core registration API. Install with the `viz` extra
+# when running the visualization demo: `pip install kiss-matcher[viz]`.
+viz = ["viser"]
 
 [tool.scikit-build]
 wheel.packages = ["kiss_matcher"]
+# python/CMakeLists.txt's out-of-tree fetch path (used when pip installs
+# from sdist / PyPI without the cpp/ tree alongside) relies on
+# `FetchContent_Declare(... SOURCE_SUBDIR ...)`, which requires CMake 3.18+.
+# Ubuntu 20.04 ships CMake 3.16, so ask scikit-build-core to provision a
+# newer cmake via the `cmake` PyPI wheel when the system cmake is too old.
+#
+# We pin below 4.0 because ROBIN downloads PMC, which has
+# `cmake_minimum_required(VERSION 2.x)` and is built via a separate
+# `DownloadProject` cmake invocation that doesn't inherit
+# `CMAKE_POLICY_VERSION_MINIMUM` from the parent. CMake 4.x hard-errors
+# on the legacy minimum, so we stay on 3.x until PMC modernizes.
+cmake.version = ">=3.18,<4"
