@@ -8,8 +8,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <cstdint>
 #include <cstring>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <set>
@@ -21,6 +23,8 @@
 #include <robin/macros.hpp>
 #include <robin/utils.hpp>
 #include <robin/views.hpp>
+
+#include <cassert>
 
 namespace robin {
 
