@@ -1,3 +1,26 @@
+## mola_sm_loop_closure (lyrical) - 1.2.2-1
+
+The packages in the `mola_sm_loop_closure` repository were released into the `lyrical` distro by running `/home/jlblanco/code/bloom-venv/bin/bloom-release -y -r lyrical mola_sm_loop_closure` on `Tue, 16 Jun 2026 22:05:49 -0000`
+
+The `mola_sm_loop_closure` package was released.
+
+Version of package(s) in repository `mola_sm_loop_closure`:
+
+- upstream repository: https://github.com/MOLAorg/mola_sm_loop_closure.git
+- release repository: https://github.com/ros2-gbp/mola_sm_loop_closure-release.git
+- rosdistro version: `1.2.0-1`
+- old version: `1.2.0-1`
+- new version: `1.2.2-1`
+
+Versions of tools used:
+
+- bloom version: `0.14.3`
+- catkin_pkg version: `0.5.2`
+- rosdep version: `0.22.2`
+- rosdistro version: `0.9.0`
+- vcstools version: `0.1.42`
+
+
 ## mola_sm_loop_closure (kilted) - 1.2.2-1
 
 The packages in the `mola_sm_loop_closure` repository were released into the `kilted` distro by running `/home/jlblanco/code/bloom-venv/bin/bloom-release -y -r kilted mola_sm_loop_closure` on `Tue, 16 Jun 2026 22:04:41 -0000`
