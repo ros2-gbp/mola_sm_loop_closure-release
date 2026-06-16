@@ -2,6 +2,20 @@
 Changelog for package mola_sm_loop_closure
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+1.2.2 (2026-06-17)
+------------------
+* update robin and kiss-matcher submodules
+* Contributors: Jose Luis Blanco-Claraco
+
+1.2.1 (2026-06-16)
+------------------
+* fix: pmc FTBFS on Debian builds
+* docs: add ROS 2 Lyrical badge row, update Rolling to Ubuntu 26.04 (resolute)
+* Merge pull request `#16 <https://github.com/MOLAorg/mola_sm_loop_closure/issues/16>`_ from MOLAorg/feat/assert-degenerated-gps
+  feat: assert on degenerated GNSS data
+* docs: update mrpt docs URI
+* Contributors: Jose Luis Blanco-Claraco
+
 1.2.0 (2026-05-11)
 ------------------
 * f2f pipeline: switch to multi-objective as default strategy

@@ -3,14 +3,23 @@
     <a href="https://github.com/MIT-SPARK/KISS-Matcher"><img src="https://img.shields.io/badge/-C++-blue?logo=cplusplus" /></a>
     <a href="https://github.com/MIT-SPARK/KISS-Matcher"><img src="https://img.shields.io/badge/Python-3670A0?logo=python&logoColor=ffdd54" /></a>
     <a href="https://github.com/MIT-SPARK/KISS-Matcher"><img src="https://img.shields.io/badge/ROS2-Humble-blue" /></a>
-    <a href="https://github.com/MIT-SPARK/KISS-Matcher"><img src="https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black" /></a>
+    <a href="https://github.com/MIT-SPARK/KISS-Matcher"><img src="https://img.shields.io/badge/Ubuntu-E95420?logo=ubuntu&logoColor=white" /></a>
+    <a href="https://github.com/MIT-SPARK/KISS-Matcher"><img src="https://img.shields.io/badge/macOS-000000?logo=apple&logoColor=white" /></a>
     <a href="https://arxiv.org/abs/2409.15615"><img src="https://img.shields.io/badge/arXiv-b33737?logo=arXiv" /></a>
+    <br />
+    <a href="https://github.com/MIT-SPARK/KISS-Matcher/actions/workflows/ci-cpp.yml"><img src="https://github.com/MIT-SPARK/KISS-Matcher/actions/workflows/ci-cpp.yml/badge.svg?branch=main" alt="C++ Core Build" /></a>
+    <a href="https://github.com/MIT-SPARK/KISS-Matcher/actions/workflows/ci-python.yml"><img src="https://github.com/MIT-SPARK/KISS-Matcher/actions/workflows/ci-python.yml/badge.svg?branch=main" alt="Python Build" /></a>
     <br />
     <br />
   <br />
   <br />
   <p align="center"><img src="https://github.com/user-attachments/assets/763bafef-c11a-4412-a9f7-f138fc12ff9f" alt="KISS Matcher" width="95%"/></p>
   <p><strong><em>Keep it simple, make it scalable.</em></strong></p>
+  <p align="center">
+    <strong>(May 19, 2026)</strong> Python package is now available on PyPI
+    <br/>
+    <a href="https://pypi.org/project/kiss-matcher/"><img src="https://readme-typing-svg.demolab.com?font=Fira+Code&weight=500&size=17&duration=2200&pause=900&color=E5E7EB&background=111827&center=true&vCenter=true&width=460&height=48&lines=%E2%9D%AF+pip+install+kiss-matcher;%E2%9C%93+ready+for+Python" alt="pip install kiss-matcher"/></a>
+  </p>
 </div>
 
 ______________________________________________________________________
@@ -26,6 +35,15 @@ git clone https://github.com/MIT-SPARK/KISS-Matcher.git
 cd KISS-Matcher
 make deps
 ```
+
+`make deps` auto-detects the host OS:
+
+- **Linux (Ubuntu/Debian):** installs the toolchain via `apt-get`.
+- **macOS (Apple Silicon / Intel):** installs the toolchain via [Homebrew](https://brew.sh).
+  AppleClang does not ship with OpenMP, so we pull in `llvm` + `libomp`
+  from Homebrew and the `Makefile` automatically routes the C++ build through
+  `$(brew --prefix llvm)/bin/clang++`. If you have not installed Homebrew yet,
+  install it first from https://brew.sh.
 
 After that, follow the C++ or Python installation instructions below.
 
@@ -69,6 +87,28 @@ After installation, `kiss_matcher` and `robin` are placed in the installation di
 
 </details>
 
+<details>
+  <summary><strong>Q. Building from a non-Makefile flow on macOS?</strong></summary>
+
+If you invoke `cmake` directly on macOS instead of going through `make
+cppinstall`, point CMake at the Homebrew LLVM toolchain so OpenMP is available:
+
+```bash
+LLVM_PREFIX=$(brew --prefix llvm)
+cmake -S cpp/kiss_matcher -B build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_C_COMPILER="$LLVM_PREFIX/bin/clang" \
+      -DCMAKE_CXX_COMPILER="$LLVM_PREFIX/bin/clang++" \
+      -DUSE_SYSTEM_ROBIN=OFF
+cmake --build build -j$(sysctl -n hw.ncpu)
+```
+
+`USE_SYSTEM_ROBIN=OFF` forces a fresh ROBIN via `FetchContent` and avoids
+picking up an older / incompatible system install. On Linux this flag is not
+required, but it is harmless.
+
+</details>
+
 #### Example codes
 
 We provide plentiful scalable registration examples. Please visit our [**cpp/example**](https://github.com/MIT-SPARK/KISS-Matcher/tree/main/cpp/examples) directory and follow the instructions.
@@ -81,16 +121,39 @@ ______________________________________________________________________
 
 ### Python
 
-The prerequisites for Pybind11 are just the minimum requirements as follows:"
+Install from PyPI (Linux x86_64 manylinux_2_28+, macOS 14+ arm64; sdist build elsewhere):
 
-```
-pip3 install --upgrade pip setuptools wheel scikit-build-core ninja cmake build
+```bash
+pip install kiss-matcher           # core only (numpy)
+pip install kiss-matcher[viz]      # adds viser for the visualization demo
 ```
 
-And then, run the following command:
+Or install editably from a source checkout:
 
+```bash
+pip install --upgrade pip setuptools wheel scikit-build-core ninja cmake build
+pip install -e python/
 ```
-pip3 install -e python/
+
+#### Quickstart
+
+After installing, run the synthetic-data smoke test (no external data, no viser):
+
+```bash
+python python/examples/quickstart.py
+```
+
+It generates 5k random points, applies a known rigid transform, and prints the
+recovered rotation/translation errors. Expect sub-degree rotation error and
+sub-centimetre translation error.
+
+For real point clouds with 3D visualization (requires `[viz]` extra):
+
+```bash
+python python/examples/run_kiss_matcher.py \
+    --src_path /path/to/src.pcd \
+    --tgt_path /path/to/tgt.pcd \
+    --resolution 0.3
 ```
 
 We also provide out-of-the-box python registration examples. Go to [**python**](https://github.com/MIT-SPARK/KISS-Matcher/tree/main/python) directory and follow the instructions.
