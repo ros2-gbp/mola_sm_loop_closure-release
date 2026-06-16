@@ -27,7 +27,14 @@ simply::
     cfg = km.KISSMatcherConfig(voxel_size=0.3)
 """
 from importlib import import_module as _im
-__version__ = "1.0.0"
+from importlib.metadata import PackageNotFoundError as _PNF, version as _v
+
+try:
+    __version__ = _v("kiss_matcher")
+except _PNF:
+    __version__ = "0.0.0+unknown"
+
+del _PNF, _v
 __all__ = []
 # Import the backend that CMake just built (“_kiss_matcher” lives inside
 # the same package directory thanks to the change above).
