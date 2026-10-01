@@ -27,13 +27,13 @@
 #include <mrpt/core/WorkerThreadsPool.h>
 #include <mrpt/maps/CSimpleMap.h>
 #include <mrpt/math/TPoint3D.h>
-#include <mrpt/opengl/CSetOfObjects.h>
 #include <mrpt/system/CTimeLogger.h>
 #include <mrpt/topography/data_types.h>
 #include <mrpt/typemeta/TEnumType.h>
+#include <mrpt/viz/CSetOfObjects.h>
 
-#include <atomic>
 #include <list>
+#include <mutex>
 #include <set>
 #include <unordered_map>
 #include <vector>
@@ -64,6 +64,15 @@ class FrameToFrameLoopClosure : public mola::LoopClosureInterface
     /** Find and apply loop closures in the input/output simplemap */
     void process(mrpt::maps::CSimpleMap& sm) override;
 
+    /** Detector-only loop closure: find candidates in a read-only snapshot and
+     *  return the ICP-estimated edges, without building/optimizing the internal
+     *  factor graph and without mutating the map. See LoopClosureInterface.
+     *  Not thread-safe (drives the per-thread ICP pipelines and PC cache); call
+     *  it from a single thread per instance. */
+    std::vector<ProposedLoopEdge> analyze(
+        const mrpt::maps::CSimpleMap&    snapshot,
+        const LoopClosureAnalyzeOptions& opts = {}) override;
+
     struct Parameters
     {
         mp2p_icp::Parameters icp_parameters;
@@ -77,8 +86,30 @@ class FrameToFrameLoopClosure : public mola::LoopClosureInterface
         double gnss_max_uncertainty_horiz = 20.0;  // [m] reject if sqrt(sigE²+sigN²) > this
         double gnss_max_uncertainty_vert  = 40.0;  // [m] reject if sigU > this
 
-        // Loop closure candidate selection
-        double min_distance_between_frames   = 20.0;  // [m] minimum separation for LC
+        /** If true, add per-keyframe IMU gravity-alignment factors
+         *  (mola::factors::MeasuredGravityFactor) constraining roll/pitch against the
+         *  measured accelerometer direction. Independent of use_gnss: this works with or
+         *  without GNSS, correcting orientation drift from accelerometer data alone.
+         *  Disabled by default: only enable it if the input simplemap actually carries
+         *  per-keyframe IMU accelerometer data (see mola::extract_imu_frames_from_sm()). */
+        bool use_imu_gravity = false;
+
+        /** Sigma [deg] for the IMU gravity-alignment factors (see use_imu_gravity). */
+        double imu_gravity_sigma_deg = 3.0;
+
+        // Loop closure candidate selection. Both bounds apply to the
+        // separation of the two keyframes IN THE CURRENT ESTIMATE, so they only
+        // mean what they say to the extent that the estimate has drifted.
+        //
+        // A revisit is a return to the same place: it appears displaced only
+        // through accumulated drift, and on an accurate estimate it appears
+        // where it is, at nearly zero separation. A non-zero floor therefore
+        // discards real loop closures first, so it defaults to zero; keyframe
+        // adjacency is min_frames_between_lc's job, and that guard does not
+        // depend on the estimate's quality. The ceiling has no such
+        // estimate-free substitute and must be set to the drift the odometry
+        // actually has.
+        double min_distance_between_frames   = 0.0;  // [m] minimum separation for LC
         double max_distance_for_lc_candidate = 50.0;  // [m] maximum distance to consider
         size_t max_lc_candidates             = 100;  // maximum candidates to check
         size_t min_frames_between_lc         = 50;  // minimum frame separation
@@ -173,6 +204,55 @@ class FrameToFrameLoopClosure : public mola::LoopClosureInterface
          */
         bool unload_observations_after_use = true;
 
+        // Parallel per-candidate ICP evaluation
+        /** If true, evaluate loop-closure candidates concurrently across worker
+         *  threads (each with its own ICP pipeline slot). Candidates are
+         *  independent pairwise registrations, so this speeds up both live scans
+         *  and the finalize pass roughly linearly with core count. */
+        bool parallel_icp_enabled = true;
+        /** Number of worker threads for candidate ICP. 0 = one per per-thread
+         *  ICP slot (hardware concurrency). Clamped to the number of slots. */
+        size_t num_icp_threads = 0;
+
+        /** Master switch for a REPRODUCIBLE scan: the same simplemap in gives
+         *  the same edges out, every time -- PROVIDED this build could pin the
+         *  runtimes it relies on. TBB and OpenMP are both optional at build
+         *  time (see CMakeLists.txt); if CMake did not find one that is
+         *  actually in use, the guarantee does not hold and DeterministicScope
+         *  says so at construction rather than letting a caller discover it by
+         *  diffing two outputs. `fully_pinned()` reports the same thing
+         *  programmatically.
+         *
+         *  Off by default because it costs wall clock -- it is one thread, all
+         *  the way down. Turn it on for a batch/offline run whose numbers are
+         *  going to be compared against another run, and leave it off for live
+         *  SLAM, where the answer only has to be good, not repeatable.
+         *
+         *  It does NOT turn off candidate parallelism -- that was measured and
+         *  is not where the nondeterminism lives. Two things are needed instead.
+         *  It sorts the accepted edges before returning, so a consumer folding
+         *  them into a graph (which typically drops a pair already closed) sees
+         *  a fixed order. And it pins, for the duration of the scan, the
+         *  parallel runtimes UNDERNEATH this library, which read none of this
+         *  library's own thread settings.
+         *
+         *  What is actually left to pin is narrower than it looks, and worth
+         *  knowing before changing any of this. mp2p_icp's pairing reduction was
+         *  the other cause and is fixed at the source (it now joins
+         *  deterministically); with that in place and KISS-Matcher disabled, a
+         *  fully parallel scan is already reproducible. The remaining cause is
+         *  KISS-Matcher, which builds an index list with its own
+         *  concatenation-joined `tbb::parallel_reduce` and uses OpenMP as well --
+         *  and which is vendored from upstream, so pinning it is the available
+         *  lever rather than fixing it.
+         *
+         *  Cost on KITTI-07: 8.5 s unpinned, 40 s here, 92.7 s if candidates are
+         *  serialized too. The output is byte-identical across all thread counts
+         *  tried, which is what "deterministic" is supposed to mean.
+         *
+         *  See DeterministicScope in module/src/ for the mechanism. */
+        bool deterministic = false;
+
         // Sensor parameters
         double max_sensor_range = 100.0;  // [m]
 
@@ -227,6 +307,15 @@ class FrameToFrameLoopClosure : public mola::LoopClosureInterface
          *  an mrpt::maps::CPointsMap-derived object. */
         std::string kiss_matcher_layer = "points_to_register_points";
 
+        /** Minimum number of final (translation) inliers for a KISS-Matcher
+         *  solution to be trusted as the ICP initial guess.  KISS-Matcher's
+         *  own `valid` flag only requires a single surviving inlier, which on
+         *  repetitive geometry (e.g. urban LiDAR) routinely yields grossly
+         *  wrong transforms (large translations, flipped orientations) that
+         *  then mislead ICP.  Below this count the graph-based guess is used
+         *  instead. */
+        uint32_t kiss_matcher_min_inliers = 5;
+
         // ===== Manual Loop Closure Hints =====
         struct ManualLoopConstraint
         {
@@ -255,6 +344,25 @@ class FrameToFrameLoopClosure : public mola::LoopClosureInterface
         lc_common::PerThreadIcpPipeline pipeline;
 
         std::shared_ptr<void> kissMatcher;  // holds kiss_matcher::KISSMatcher when enabled
+
+        // Per-thread LRU point-cloud cache. Kept per-thread (not shared) so that
+        // candidate ICP runs concurrently without racing on a shared cloud's
+        // lazily-built KD-tree. Budget below is per-thread (params_.pc_cache_max_bytes).
+        struct CachedPC
+        {
+            mp2p_icp::metric_map_t::Ptr pc;
+            size_t                      approxBytes = 0;
+        };
+        std::unordered_map<frame_id_t, CachedPC> pcCache;
+        std::list<frame_id_t>                    pcLruOrder;  // front = most recent
+        size_t                                   pcCacheTotalBytes = 0;
+
+        void cacheClear()
+        {
+            pcCache.clear();
+            pcLruOrder.clear();
+            pcCacheTotalBytes = 0;
+        }
     };
 
     struct State
@@ -262,6 +370,11 @@ class FrameToFrameLoopClosure : public mola::LoopClosureInterface
         bool initialized = false;
 
         const mrpt::maps::CSimpleMap* sm = nullptr;
+
+        /// True while running the detector-only analyze() over a caller-owned
+        /// snapshot: point-cloud generation must then leave observations intact
+        /// (no unload) since we must not mutate the borrowed map.
+        bool readOnlySnapshot = false;
 
         // Per-thread ICP instances
         std::vector<PerThreadState> perThreadState_{
@@ -292,22 +405,13 @@ class FrameToFrameLoopClosure : public mola::LoopClosureInterface
         // Planarity factor graph (rebuilt each LC round when assume_planar_world=true)
         gtsam::NonlinearFactorGraph planarityFG;
 
-        // LRU point cloud cache
-        struct CachedPC
-        {
-            mp2p_icp::metric_map_t::Ptr pc;
-            size_t                      approxBytes = 0;
-        };
-
-        std::unordered_map<frame_id_t, CachedPC> pcCache;
-        std::list<frame_id_t>                    pcLruOrder;  // front = most recent
-        size_t                                   pcCacheTotalBytes = 0;
-
+        /// Clears every per-thread point-cloud cache (called between scans).
         void pcCacheClear()
         {
-            pcCache.clear();
-            pcLruOrder.clear();
-            pcCacheTotalBytes = 0;
+            for (auto& pts : perThreadState_)
+            {
+                pts.cacheClear();
+            }
         }
     };
 
@@ -315,9 +419,6 @@ class FrameToFrameLoopClosure : public mola::LoopClosureInterface
 
     mrpt::system::CTimeLogger profiler_{true, "frame_to_frame_lc"};
     mrpt::WorkerThreadsPool   threads_{state_.perThreadState_.size()};
-
-    // Round-robin counter for distributing candidates across per-thread state slots.
-    std::atomic<size_t> lc_candidate_counter_{0};
 
     // Private methods
     mrpt::poses::CPose3D frame_pose_in_simplemap(frame_id_t frameId) const;
@@ -328,14 +429,18 @@ class FrameToFrameLoopClosure : public mola::LoopClosureInterface
     /** Get point cloud for a frame, using the LRU cache */
     mp2p_icp::metric_map_t::Ptr get_cached_pointcloud(frame_id_t frameId, size_t threadIdx);
 
-    /** Evict oldest entries from the PC cache until under the size limit */
-    void evict_pc_cache();
+    /** Evict oldest entries from a per-thread PC cache until under the limit */
+    void evict_pc_cache(PerThreadState& pts);
 
     /** Build initial graph with odometry and GNSS factors */
     void build_initial_graph();
 
     /** Add GNSS factors to the graph */
     void add_gnss_factors();
+
+    /** Adds per-keyframe IMU gravity-alignment factors (see Parameters::use_imu_gravity). */
+    /// Returns true if at least one IMU gravity-alignment factor was added.
+    bool add_imu_gravity_factors();
 
     struct LoopCandidate
     {
@@ -346,9 +451,33 @@ class FrameToFrameLoopClosure : public mola::LoopClosureInterface
         mrpt::math::TPoint3D spatialMidpoint = {0, 0, 0};  // (pose_i + pose_j) / 2
     };
 
-    /** Find potential loop closure candidates */
+    /** Find potential loop closure candidates.
+     *  \param minLaterFrame If >0, only generate pairs whose later frame index
+     *         is >= this value (used for incremental, new-keyframe-only scans). */
     std::vector<LoopCandidate> find_loop_candidates(
-        const std::set<std::pair<frame_id_t, frame_id_t>>& alreadyChecked) const;
+        const std::set<std::pair<frame_id_t, frame_id_t>>& alreadyChecked,
+        frame_id_t                                         minLaterFrame = 0) const;
+
+    /** Result of running ICP on one loop-closure candidate: the relative pose
+     *  edge (i -> j) with the same diagonal, additive-noise-inflated covariance
+     *  used for the graph BetweenFactor, plus the ICP goodness. */
+    struct LcIcpEdge
+    {
+        mrpt::poses::CPose3DPDFGaussian relPose;  ///< i -> j, diagonal cov
+        gtsam::Vector6                  sigmas;  ///< gtsam Pose3 tangent order
+        double                          quality = 0;  ///< ICP goodness [0,1]
+    };
+
+    /** Run ICP for a single candidate and build its edge (no graph mutation).
+     *  Returns nullopt if point clouds are missing or ICP goodness is below
+     *  min_icp_goodness. Shared by process_loop_candidate() and analyze(). */
+    /// Registers one candidate pair with ICP using per-thread slot `threadIdx`
+    /// (its own ICP pipeline + KISS-Matcher instance), so calls with distinct
+    /// slots run concurrently. `profile` gates the per-candidate time-logger
+    /// sections, which must be off when several candidates run in parallel
+    /// (CTimeLogger forbids the same section name from multiple threads).
+    std::optional<LcIcpEdge> run_lc_icp(
+        const LoopCandidate& lc, size_t threadIdx, bool profile = true);
 
     /** Process a single loop closure candidate with ICP.
      *  Returns the factor index in graphFG on success, or nullopt on failure. */
