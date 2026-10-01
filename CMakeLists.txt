@@ -34,9 +34,9 @@ find_package(mola_relocalization REQUIRED)
 find_package(mola_yaml REQUIRED)
 find_package(mp2p_icp REQUIRED)
 find_package(mp2p_icp_filters REQUIRED)
-find_package(mrpt-gui REQUIRED)
-find_package(mrpt-maps REQUIRED)
-find_package(mrpt-tclap REQUIRED)
+find_package(mrpt_maps REQUIRED)
+find_package(mrpt_viz REQUIRED)
+find_package(CLI11 REQUIRED)
 
 # -----------------------
 # define lib:
@@ -75,8 +75,8 @@ mola_add_library(
     mola::mola_yaml
     mola::mp2p_icp
     mola::mp2p_icp_filters
-    mrpt::gui
-    mrpt::maps
+    mrpt::mrpt_maps
+    mrpt::mrpt_viz
 #	PRIVATE_LINK_LIBRARIES
   CMAKE_DEPENDENCIES
     mola_georeferencing
@@ -85,12 +85,55 @@ mola_add_library(
     mola_relocalization
     mp2p_icp
     mp2p_icp_filters
-    mrpt-maps
+    mrpt_maps
+    mrpt_viz
 )
+
+# Optional, and only used by the `deterministic` parameter: pinning a scan to
+# one thread means pinning the parallel runtimes UNDERNEATH this library, since
+# neither reads our own thread settings. TBB is what mp2p_icp reduces its
+# correspondence list and its Gauss-Newton normal equations with; OpenMP is what
+# KISS-Matcher's ROBINMatching uses. Missing either only costs reproducibility,
+# and DeterministicScope says so at runtime rather than pretending, so neither
+# is REQUIRED here.
+find_package(TBB QUIET)
+if(TBB_FOUND)
+  message(STATUS "TBB found: `deterministic` can pin mp2p_icp's reductions")
+  target_link_libraries(${PROJECT_NAME} PRIVATE TBB::tbb)
+  target_compile_definitions(${PROJECT_NAME} PRIVATE MOLA_SM_LC_HAS_TBB)
+else()
+  message(WARNING "TBB NOT found: the `deterministic` parameter cannot pin "
+                  "mp2p_icp's parallel reductions, so scans stay non-reproducible")
+endif()
+
+find_package(OpenMP QUIET COMPONENTS CXX)
+if(OpenMP_CXX_FOUND)
+  message(STATUS "OpenMP found: `deterministic` can pin KISS-Matcher's OpenMP regions")
+  target_link_libraries(${PROJECT_NAME} PRIVATE OpenMP::OpenMP_CXX)
+  target_compile_definitions(${PROJECT_NAME} PRIVATE MOLA_SM_LC_HAS_OPENMP)
+else()
+  message(STATUS "OpenMP NOT found: `deterministic` cannot pin KISS-Matcher's OpenMP regions")
+endif()
 
 # Check mp2p_icp version for log functor support
 if(mp2p_icp_VERSION VERSION_GREATER_EQUAL "2.6.0")
   target_compile_definitions(${PROJECT_NAME} PRIVATE MP2P_ICP_HAS_LOG_FUNCTOR)
+endif()
+
+# Detect whether mola_georeferencing exposes the newer, unified
+# extract_imu_frames_from_sm()/IMUFrames API (gravity + absolute attitude), or only the
+# older extract_imu_acc_frames_from_sm()/IMUAccFrames one, kept for old installed versions.
+# A version check is not reliable here since the new API landed without a version bump,
+# so probe for it directly instead.
+include(CheckCXXSourceCompiles)
+set(CMAKE_REQUIRED_LIBRARIES mola::mola_georeferencing)
+check_cxx_source_compiles(
+  "#include <mola_georeferencing/simplemap_georeference.h>
+   int main() { auto fn = &mola::extract_imu_frames_from_sm; (void)fn; return 0; }"
+  MOLA_GEOREFERENCING_HAS_NEW_IMU_API)
+unset(CMAKE_REQUIRED_LIBRARIES)
+if(MOLA_GEOREFERENCING_HAS_NEW_IMU_API)
+  target_compile_definitions(${PROJECT_NAME} PRIVATE MOLA_GEOREFERENCING_HAS_NEW_IMU_API)
 endif()
 
 # Optional: KISS-Matcher for global-registration initial guesses in F2F loop closure.
@@ -119,6 +162,28 @@ if(EXISTS "${_KISS_MATCHER_CMAKE}" AND EXISTS "${_ROBIN_DIR}")
   if(TARGET pmc)
     target_compile_options(pmc PRIVATE -Wno-format-security)
   endif()
+  # Silence upstream warnings in third-party sources we don't maintain.
+  if(TARGET robin)
+    target_compile_options(robin PRIVATE -Wno-return-type)
+  endif()
+  if(TARGET kiss_matcher_core)
+    target_compile_options(kiss_matcher_core PRIVATE -Wno-unused-variable)
+  endif()
+  # Treat KISS-Matcher's (and dependencies') headers as system headers so
+  # their internal warnings (shadowing, macro redefinition, etc.) don't
+  # pollute the build of our own code that includes them.
+  # Portable across CMake versions (Humble ships CMake 3.22): apply the
+  # SYSTEM keyword to our own target's view of their include directories,
+  # rather than relying on the SYSTEM target property (CMake >= 3.25 only).
+  foreach(_dep_target kiss_matcher_core robin pmc)
+    if(TARGET ${_dep_target})
+      get_target_property(_dep_includes ${_dep_target} INTERFACE_INCLUDE_DIRECTORIES)
+      if(_dep_includes)
+        target_include_directories(${PROJECT_NAME} SYSTEM PRIVATE ${_dep_includes})
+      endif()
+    endif()
+  endforeach()
+  unset(_dep_includes)
   target_compile_definitions(${PROJECT_NAME} PRIVATE MOLA_HAS_KISS_MATCHER)
   target_link_libraries(${PROJECT_NAME} PRIVATE kiss_matcher::kiss_matcher_core)
 elseif(EXISTS "${_KISS_MATCHER_CMAKE}" AND NOT EXISTS "${_ROBIN_DIR}")
@@ -145,8 +210,8 @@ mola_add_executable(
   SOURCES apps/mola-sm-lc-cli.cpp
   LINK_LIBRARIES
     ${PROJECT_NAME}
-    mrpt::maps
-    mrpt::tclap
+    mrpt::mrpt_maps
+    CLI11::CLI11
 )
 
 
