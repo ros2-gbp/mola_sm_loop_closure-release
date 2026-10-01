@@ -19,6 +19,7 @@
 #include <gtsam/slam/BetweenFactor.h>
 #include <mola_georeferencing/simplemap_georeference.h>
 #include <mola_gtsam_factors/FactorGnssEnu.h>
+#include <mola_gtsam_factors/MeasuredGravityFactor.h>
 #include <mola_gtsam_factors/gtsam_detect_version.h>
 #include <mola_sm_loop_closure/FrameToFrameLoopClosure.h>
 #include <mola_sm_loop_closure/common/debug_flags.h>
@@ -38,25 +39,31 @@
 #include <mrpt/obs/CObservationGPS.h>
 #include <mrpt/obs/CObservationPointCloud.h>
 #include <mrpt/obs/CObservationVelodyneScan.h>
-#include <mrpt/opengl/CGridPlaneXY.h>
-#include <mrpt/opengl/CPointCloud.h>
-#include <mrpt/opengl/CSetOfLines.h>
-#include <mrpt/opengl/Scene.h>
-#include <mrpt/opengl/Viewport.h>
-#include <mrpt/opengl/opengl_fonts.h>
 #include <mrpt/poses/CPose3DInterpolator.h>
 #include <mrpt/poses/Lie/SO.h>
 #include <mrpt/poses/gtsam_wrappers.h>
 #include <mrpt/system/filesystem.h>
+#include <mrpt/viz/CGridPlaneXY.h>
+#include <mrpt/viz/CPointCloud.h>
+#include <mrpt/viz/CSetOfLines.h>
+#include <mrpt/viz/Scene.h>
+#include <mrpt/viz/Viewport.h>
+#include <mrpt/viz/opengl_fonts.h>
 
 #ifdef MOLA_HAS_KISS_MATCHER
 #include <kiss_matcher/KISSMatcher.hpp>
 #endif
 
+#include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <future>
+#include <mutex>
+
+#include "DeterministicScope.h"
 
 using namespace mola;
 
@@ -225,12 +232,19 @@ void FrameToFrameLoopClosure::initialize(const mrpt::containers::yaml& c)
     YAML_LOAD_OPT(params_, gnss_max_uncertainty_horiz, double);
     YAML_LOAD_OPT(params_, gnss_max_uncertainty_vert, double);
 
+    YAML_LOAD_OPT(params_, use_imu_gravity, bool);
+    YAML_LOAD_OPT(params_, imu_gravity_sigma_deg, double);
+
     YAML_LOAD_OPT(params_, min_distance_between_frames, double);
     YAML_LOAD_OPT(params_, max_distance_for_lc_candidate, double);
     YAML_LOAD_OPT(params_, max_lc_candidates, size_t);
     YAML_LOAD_OPT(params_, min_frames_between_lc, size_t);
     YAML_LOAD_OPT(params_, max_lc_optimization_rounds, size_t);
     YAML_LOAD_OPT(params_, lc_optimize_every_n, size_t);
+
+    YAML_LOAD_OPT(params_, parallel_icp_enabled, bool);
+    YAML_LOAD_OPT(params_, num_icp_threads, size_t);
+    YAML_LOAD_OPT(params_, deterministic, bool);
 
     if (params_.min_frames_between_lc == 0)
     {
@@ -283,6 +297,7 @@ void FrameToFrameLoopClosure::initialize(const mrpt::containers::yaml& c)
     YAML_LOAD_OPT(params_, use_kiss_matcher, bool);
     YAML_LOAD_OPT(params_, kiss_matcher_resolution, double);
     YAML_LOAD_OPT(params_, kiss_matcher_layer, std::string);
+    YAML_LOAD_OPT(params_, kiss_matcher_min_inliers, uint32_t);
 
     YAML_LOAD_OPT(params_, largest_delta_for_reconsider, double);
     YAML_LOAD_OPT(params_, max_sensor_range, double);
@@ -317,20 +332,19 @@ void FrameToFrameLoopClosure::initialize(const mrpt::containers::yaml& c)
         for (const auto& entryNode : cfg["manual_loop_constraints"].asSequenceRange())
         {
             ASSERT_(entryNode.isMap());
-            const auto& entry = entryNode.asMap();
+            const mrpt::containers::yaml entry(entryNode);
 
             Parameters::ManualLoopConstraint mlc;
             ASSERTMSG_(
-                entry.count("timestamp_i") != 0 && entry.count("timestamp_j") != 0 &&
-                    entry.count("sigma_xyz") != 0,
+                entry.has("timestamp_i") && entry.has("timestamp_j") && entry.has("sigma_xyz"),
                 "Each manual_loop_constraints entry must have: timestamp_i, timestamp_j, "
                 "sigma_xyz");
 
-            mlc.timestamp_i = entry.at("timestamp_i").as<double>();
-            mlc.timestamp_j = entry.at("timestamp_j").as<double>();
-            mlc.sigma_xyz   = entry.at("sigma_xyz").as<double>();
-            if (entry.count("trust_as_inlier") != 0)
-                mlc.trust_as_inlier = entry.at("trust_as_inlier").as<bool>();
+            mlc.timestamp_i = entry["timestamp_i"].as<double>();
+            mlc.timestamp_j = entry["timestamp_j"].as<double>();
+            mlc.sigma_xyz   = entry["sigma_xyz"].as<double>();
+            if (entry.has("trust_as_inlier"))
+                mlc.trust_as_inlier = entry["trust_as_inlier"].as<bool>();
 
             params_.manual_loop_constraints.push_back(mlc);
         }
@@ -388,11 +402,20 @@ void FrameToFrameLoopClosure::process(mrpt::maps::CSimpleMap& sm)  // NOLINT
     using namespace std::string_literals;
 
     ASSERT_(state_.initialized);
-    state_.sm = &sm;
+
+    // Same contract as analyze(): with `deterministic` set, this whole batch
+    // pass -- every ICP inside it, and every parallel runtime underneath --
+    // runs on one thread, so the corrected map is a function of the input.
+    const DeterministicScope detScope{params_.deterministic, this};
+
+    state_.sm               = &sm;
+    state_.readOnlySnapshot = false;
     state_.pcCacheClear();
     accepted_lc_edges_.clear();
 
-    MRPT_LOG_INFO_STREAM("Processing simplemap with " << sm.size() << " frames");
+    MRPT_LOG_INFO_STREAM(
+        "Processing simplemap with " << sm.size() << " frames"
+                                     << (params_.deterministic ? " [deterministic]" : ""));
 
     // Precompute which frames have mapping-capable observations, so that
     // find_loop_candidates() does not need to access (and lazy-load) the
@@ -450,6 +473,20 @@ void FrameToFrameLoopClosure::process(mrpt::maps::CSimpleMap& sm)  // NOLINT
         {
             save_trajectory_as_tum(
                 params_.debug_files_prefix + "after_gnss.tum"s,
+                params_.save_trajectory_files_with_cov);
+        }
+    }
+
+    // Add IMU gravity-alignment factors if requested (works with or without GNSS)
+    if (params_.use_imu_gravity && add_imu_gravity_factors())
+    {
+        MRPT_LOG_INFO("Running optimization after IMU gravity-alignment factors...");
+        optimize_graph();
+
+        if (params_.save_trajectory_files)
+        {
+            save_trajectory_as_tum(
+                params_.debug_files_prefix + "after_imu_gravity.tum"s,
                 params_.save_trajectory_files_with_cov);
         }
     }
@@ -717,6 +754,11 @@ void FrameToFrameLoopClosure::build_initial_graph()
     ASSERT_(state_.sm);
     const auto& sm = *state_.sm;
 
+    // Start from a pristine graph: gtsam Values::insert() throws on duplicate
+    // keys, so guard against stale state left by a prior analyze()/process().
+    state_.graphValues.clear();
+    state_.graphFG.resize(0);
+
     // Add all frame poses to values
     for (size_t i = 0; i < sm.size(); i++)
     {
@@ -792,6 +834,72 @@ void FrameToFrameLoopClosure::add_gnss_factors()
 
     lc_common::add_gnss_factors_per_kf(
         state_.graphFG, *state_.sm, state_.globalGeoRef, p, state_.knownInlierFactorIndices, this);
+}
+
+bool FrameToFrameLoopClosure::add_imu_gravity_factors()
+{
+    using gtsam::symbol_shorthand::T;
+    using gtsam::symbol_shorthand::X;
+
+    mrpt::system::CTimeLoggerEntry tle(profiler_, "add_imu_gravity_factors");
+
+    ASSERT_(state_.sm);
+
+#ifdef MOLA_GEOREFERENCING_HAS_NEW_IMU_API
+    const auto imuFrames = mola::extract_imu_frames_from_sm(*state_.sm);
+#else
+    const auto imuFrames = mola::extract_imu_acc_frames_from_sm(*state_.sm);
+#endif
+    if (imuFrames.frames.empty())
+    {
+        MRPT_LOG_WARN(
+            "use_imu_gravity=true but no per-keyframe IMU accelerometer data was found in the "
+            "input simplemap; skipping IMU gravity-alignment factors.");
+        return false;
+    }
+
+    // T(0) is a fixed anchor for the ENU->map transform, as required by
+    // MeasuredGravityFactor's signature. Frame poses here already live in the map frame (X(i)
+    // keys, see build_initial_graph()), so T(0) is simply locked at Identity.
+    if (!state_.graphValues.exists(T(0)))
+    {
+        state_.graphValues.insert(T(0), gtsam::Pose3::Identity());
+        auto tightNoise = gtsam::noiseModel::Isotropic::Sigma(6, 1e-6);
+        state_.knownInlierFactorIndices.push_back(state_.graphFG.size());
+        state_.graphFG.emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(
+            T(0), gtsam::Pose3::Identity(), tightNoise);
+    }
+
+    ASSERTMSG_(
+        params_.imu_gravity_sigma_deg > 0,
+        "params_.imu_gravity_sigma_deg must be a positive angle in degrees");
+
+    auto accNoise =
+        gtsam::noiseModel::Isotropic::Sigma(3, mrpt::DEG2RAD(params_.imu_gravity_sigma_deg));
+
+    const std::size_t before = state_.graphFG.size();
+    for (const auto& frame : imuFrames.frames)
+    {
+#ifdef MOLA_GEOREFERENCING_HAS_NEW_IMU_API
+        if (!frame.normalizedAcc)
+        {
+            continue;
+        }
+        const auto& normalizedAcc = *frame.normalizedAcc;
+#else
+        const auto& normalizedAcc = frame.normalizedAcc;
+#endif
+        const auto sensorOnVehicle = mrpt::gtsam_wrappers::toPose3(frame.sensorPoseOnVehicle);
+        state_.knownInlierFactorIndices.push_back(state_.graphFG.size());
+        state_.graphFG.emplace_shared<mola::factors::MeasuredGravityFactor>(
+            T(0), X(frame.kf_index), sensorOnVehicle, normalizedAcc, accNoise);
+    }
+    const std::size_t after = state_.graphFG.size();
+    MRPT_LOG_INFO_STREAM(
+        "Added " << (after - before) << " IMU gravity factors over " << imuFrames.frames.size()
+                 << " IMU keyframes");
+
+    return after > before;
 }
 
 void FrameToFrameLoopClosure::add_manual_loop_closure_factors()
@@ -925,7 +1033,7 @@ void FrameToFrameLoopClosure::add_manual_loop_closure_factors()
         auto factor = boost::make_shared<gtsam::BetweenFactor<gtsam::Pose3>>(
             X(fi), X(fj), deltaPose, edgeNoise);
 #else
-        auto factor = std::make_shared<gtsam::BetweenFactor<gtsam::Pose3>>(
+        auto        factor        = std::make_shared<gtsam::BetweenFactor<gtsam::Pose3>>(
             X(fi), X(fj), deltaPose, edgeNoise);
 #endif
         state_.graphFG += factor;
@@ -945,8 +1053,8 @@ void FrameToFrameLoopClosure::add_manual_loop_closure_factors()
 
 auto FrameToFrameLoopClosure::
     find_loop_candidates(  // NOLINT(readability-function-cognitive-complexity)
-        const std::set<std::pair<frame_id_t, frame_id_t>>& alreadyChecked) const
-    -> std::vector<FrameToFrameLoopClosure::LoopCandidate>
+        const std::set<std::pair<frame_id_t, frame_id_t>>& alreadyChecked,
+        frame_id_t minLaterFrame) const -> std::vector<FrameToFrameLoopClosure::LoopCandidate>
 {
     mrpt::system::CTimeLoggerEntry tle(profiler_, "find_loop_candidates");
 
@@ -987,7 +1095,11 @@ auto FrameToFrameLoopClosure::
     {
         const auto pose_i = state_.get_pose(i);
 
-        for (size_t j = i + params_.min_frames_between_lc; j < sm.size(); j++)
+        // Incremental scans skip pairs whose later frame predates the newest
+        // batch (both endpoints already evaluated in a previous call).
+        const size_t jStart = std::max<size_t>(i + params_.min_frames_between_lc, minLaterFrame);
+
+        for (size_t j = jStart; j < sm.size(); j++)
         {
             // Check if already evaluated
             const auto frameGroup_i = mrpt::round(static_cast<double>(i) / frameGroup);
@@ -1290,14 +1402,17 @@ auto FrameToFrameLoopClosure::
     return finalCandidates;
 }
 
-std::optional<size_t> FrameToFrameLoopClosure::process_loop_candidate(const LoopCandidate& lc)
+std::optional<FrameToFrameLoopClosure::LcIcpEdge> FrameToFrameLoopClosure::run_lc_icp(
+    const LoopCandidate& lc, size_t threadIdx, bool profile)
 {
-    using gtsam::symbol_shorthand::X;
+    // Per-candidate profiling is disabled when candidates run in parallel, since
+    // CTimeLogger forbids the same section name being timed from several threads.
+    std::optional<mrpt::system::CTimeLoggerEntry> tle;
+    if (profile)
+    {
+        tle.emplace(profiler_, "run_lc_icp");
+    }
 
-    mrpt::system::CTimeLoggerEntry tle(profiler_, "process_loop_candidate");
-
-    const size_t threadIdx = lc_candidate_counter_.fetch_add(1, std::memory_order_relaxed) %
-                             state_.perThreadState_.size();
     ASSERT_(threadIdx < state_.perThreadState_.size());
 
     // Get point clouds for both frames (using LRU cache)
@@ -1321,7 +1436,11 @@ std::optional<size_t> FrameToFrameLoopClosure::process_loop_candidate(const Loop
 #ifdef MOLA_HAS_KISS_MATCHER
     if (params_.use_kiss_matcher && pts.kissMatcher != nullptr)
     {
-        mrpt::system::CTimeLoggerEntry tle_km(profiler_, "kiss_matcher_initial_guess");
+        std::optional<mrpt::system::CTimeLoggerEntry> tle_km;
+        if (profile)
+        {
+            tle_km.emplace(profiler_, "kiss_matcher_initial_guess");
+        }
 
         auto extractEigen = [&](const mp2p_icp::metric_map_t& pc) -> std::vector<Eigen::Vector3f>
         {
@@ -1352,9 +1471,13 @@ std::optional<size_t> FrameToFrameLoopClosure::process_loop_candidate(const Loop
 
         if (!src_pts.empty() && !tgt_pts.empty())
         {
-            const auto sol = static_cast<kiss_matcher::KISSMatcher*>(pts.kissMatcher.get())
-                                 ->estimate(src_pts, tgt_pts);
-            if (sol.valid)
+            auto*      km  = static_cast<kiss_matcher::KISSMatcher*>(pts.kissMatcher.get());
+            const auto sol = km->estimate(src_pts, tgt_pts);
+            // KISS-Matcher's `valid` flag only requires one surviving inlier;
+            // gate on the actual final-inlier count so grossly wrong global
+            // registrations (which mislead ICP) fall back to the graph guess.
+            const auto nInliers = km->getNumFinalInliers();
+            if (sol.valid && nInliers >= params_.kiss_matcher_min_inliers)
             {
                 mrpt::math::CMatrixDouble44 T = mrpt::math::CMatrixDouble44::Identity();
                 for (int r = 0; r < 3; r++)
@@ -1370,13 +1493,15 @@ std::optional<size_t> FrameToFrameLoopClosure::process_loop_candidate(const Loop
                 initGuess = mrpt::poses::CPose3D(T).asTPose();
                 MRPT_LOG_DEBUG_STREAM(
                     "KISS-Matcher valid guess for LC " << lc.frame_i << "<->" << lc.frame_j
+                                                       << " inliers=" << nInliers
                                                        << " T=" << initGuess);
             }
             else
             {
                 MRPT_LOG_DEBUG_STREAM(
-                    "KISS-Matcher invalid solution for LC " << lc.frame_i << "<->" << lc.frame_j
-                                                            << "; using graph-based guess");
+                    "KISS-Matcher rejected for LC "
+                    << lc.frame_i << "<->" << lc.frame_j << " (valid=" << sol.valid
+                    << " inliers=" << nInliers << "); using graph-based guess");
             }
         }
     }
@@ -1404,21 +1529,58 @@ std::optional<size_t> FrameToFrameLoopClosure::process_loop_candidate(const Loop
         return std::nullopt;
     }
 
-    // Add ICP edge to graph
-    const size_t newFactorIdx = state_.graphFG.size();
-    const auto   deltaPose    = mrpt::gtsam_wrappers::toPose3(icp_result.optimal_tf.mean);
+    // Edge noise: ICP covariance diagonal inflated by an additive floor. This
+    // is the same recipe the graph BetweenFactor uses, so both the graph path
+    // (process_loop_candidate) and the detector path (analyze) see identical
+    // uncertainty.
+    // covDiag is in MRPT order: x, y, z, yaw, pitch, roll.
+    const auto covDiag = icp_result.optimal_tf.cov.asEigen().diagonal().array().sqrt();
 
-    gtsam::Vector6 sigmas;
-    const auto     covDiag = icp_result.optimal_tf.cov.asEigen().diagonal().array().sqrt();
+    LcIcpEdge edge;
+    edge.quality = icp_result.quality;
 
-    sigmas << covDiag[5] + mrpt::DEG2RAD(params_.icp_edge_additional_noise_ang),
+    // gtsam Pose3 tangent order: [rot_x rot_y rot_z, x y z].
+    edge.sigmas << covDiag[5] + mrpt::DEG2RAD(params_.icp_edge_additional_noise_ang),
         covDiag[4] + mrpt::DEG2RAD(params_.icp_edge_additional_noise_ang),
         covDiag[3] + mrpt::DEG2RAD(params_.icp_edge_additional_noise_ang),
         covDiag[0] + params_.icp_edge_additional_noise_xyz,
         covDiag[1] + params_.icp_edge_additional_noise_xyz,
         covDiag[2] + params_.icp_edge_additional_noise_xyz;
 
-    auto edgeNoise = gtsam::noiseModel::Diagonal::Sigmas(sigmas);
+    // Mirror the same inflated diagonal into an MRPT covariance (order x, y, z,
+    // yaw, pitch, roll) so callers that don't speak gtsam get the identical
+    // edge uncertainty.
+    const auto sq     = [](double v) { return v * v; };
+    edge.relPose.mean = icp_result.optimal_tf.mean;
+    edge.relPose.cov.setZero();
+    edge.relPose.cov(0, 0) = sq(edge.sigmas[3]);  // x
+    edge.relPose.cov(1, 1) = sq(edge.sigmas[4]);  // y
+    edge.relPose.cov(2, 2) = sq(edge.sigmas[5]);  // z
+    edge.relPose.cov(3, 3) = sq(edge.sigmas[2]);  // yaw
+    edge.relPose.cov(4, 4) = sq(edge.sigmas[1]);  // pitch
+    edge.relPose.cov(5, 5) = sq(edge.sigmas[0]);  // roll
+
+    return edge;
+}
+
+std::optional<size_t> FrameToFrameLoopClosure::process_loop_candidate(const LoopCandidate& lc)
+{
+    using gtsam::symbol_shorthand::X;
+
+    mrpt::system::CTimeLoggerEntry tle(profiler_, "process_loop_candidate");
+
+    // Self-optimizing path is sequential: use slot 0 and keep profiling on.
+    const auto edge = run_lc_icp(lc, /*threadIdx=*/0);
+    if (!edge)
+    {
+        return std::nullopt;
+    }
+
+    // Add ICP edge to graph
+    const size_t newFactorIdx = state_.graphFG.size();
+    const auto   deltaPose    = mrpt::gtsam_wrappers::toPose3(edge->relPose.mean);
+
+    auto edgeNoise = gtsam::noiseModel::Diagonal::Sigmas(edge->sigmas);
 
     // LC edges use plain Gaussian noise (no robust kernel here).
     // The GNC optimizer handles outlier rejection for these edges.
@@ -1428,6 +1590,276 @@ std::optional<size_t> FrameToFrameLoopClosure::process_loop_candidate(const Loop
     accepted_lc_edges_.emplace_back(lc.frame_i, lc.frame_j);
 
     return newFactorIdx;
+}
+
+std::vector<ProposedLoopEdge> FrameToFrameLoopClosure::analyze(
+    const mrpt::maps::CSimpleMap& snapshot, const LoopClosureAnalyzeOptions& opts)
+{
+    using gtsam::symbol_shorthand::X;
+
+    const auto& sm = snapshot;
+
+    ASSERT_(state_.initialized);
+
+    mrpt::system::CTimeLoggerEntry tle(profiler_, "analyze");
+
+    // Detector-only pass: we own no graph and must not mutate the map. Set up
+    // just enough state for candidate search + per-candidate ICP.
+    state_.sm               = &sm;
+    state_.readOnlySnapshot = true;
+
+    // Always clear the borrowed snapshot pointer and read-only flag on exit
+    // (including on an early return or exception), so no dangling pointer or
+    // stale flag survives into later calls.
+    struct SnapshotGuard
+    {
+        State* st;
+        ~SnapshotGuard()
+        {
+            st->sm               = nullptr;
+            st->readOnlySnapshot = false;
+        }
+    } snapshotGuard{&state_};
+
+    state_.pcCacheClear();
+    accepted_lc_edges_.clear();
+
+    MRPT_LOG_INFO_STREAM("analyze(): scanning simplemap with " << sm.size() << " frames");
+
+    // Precompute which frames have mapping-capable observations (used by
+    // find_loop_candidates to avoid lazy-loading raw frames per pair). This is a
+    // read-only flow over a caller-owned snapshot, so unlike process() we must
+    // not unload/modify the observations here.
+    state_.frameHasMappingObs.assign(sm.size(), false);
+    for (size_t i = 0; i < sm.size(); i++)
+    {
+        const auto& kf               = sm.get(i);
+        state_.frameHasMappingObs[i] = kf.sf && frame_has_mapping_observations(*kf.sf);
+    }
+
+    // Seed only the initial poses (no odometry/GNSS factors, no optimization):
+    // candidate search and ICP initial guesses read these via State::get_pose().
+    state_.graphValues.clear();
+    state_.graphFG.resize(0);
+    for (size_t i = 0; i < sm.size(); i++)
+    {
+        state_.graphValues.insert(X(i), mrpt::gtsam_wrappers::toPose3(frame_pose_in_simplemap(i)));
+    }
+
+    // Seed with pairs the caller already closed so candidate selection skips
+    // them and spends its budget on as-yet-unclosed loops (drives the finalize
+    // cascade toward new revisit regions each round).
+    const std::set<std::pair<frame_id_t, frame_id_t>> alreadyChecked(
+        opts.exclude_pairs.begin(), opts.exclude_pairs.end());
+    const frame_id_t minLaterFrame = opts.first_new_keyframe.value_or(0);
+    const auto       candidates    = find_loop_candidates(alreadyChecked, minLaterFrame);
+
+    MRPT_LOG_INFO_STREAM(
+        "analyze(): " << candidates.size() << " loop closure candidates"
+                      << (minLaterFrame != 0 ? " (incremental)" : ""));
+
+    std::vector<ProposedLoopEdge> out;
+    out.reserve(candidates.size());
+    std::atomic<bool> aborted{false};
+
+    // Live progress reporting: total is fixed for the pass, evaluated grows as
+    // ICP runs. The consumer derives a per-scan pending-queue depth from
+    // (total - done). Kept as an atomic so both the sequential and parallel
+    // paths update it uniformly.
+    const std::size_t        candidatesTotal = candidates.size();
+    std::atomic<std::size_t> evaluated{0};
+    auto                     reportProgress = [&]
+    {
+        if (opts.on_progress)
+        {
+            opts.on_progress(evaluated.load(std::memory_order_relaxed), candidatesTotal);
+        }
+    };
+    reportProgress();  // initial (0 / total), so a listener sees the queue fill
+
+    // Loop-closure candidates are independent pairwise registrations, so their
+    // ICP tests can run concurrently. Resolve the worker count: one per-thread
+    // ICP slot (each with its own pipeline + KISS-Matcher instance), optionally
+    // capped by num_icp_threads, and never more than the candidate count.
+    //
+    // `deterministic` does NOT turn off candidate parallelism, and that is a
+    // measured decision rather than an oversight. Once the reduction underneath
+    // (mp2p_icp's pairing list) is order-stable, evaluating candidates
+    // concurrently is reproducible on its own: each candidate is an independent
+    // registration on its own ICP slot, and the accepted edges are sorted below.
+    // What is left needing a pin is the parallelism INSIDE a candidate, which
+    // the scope handles. Serializing the candidates too would cost ~8x for no
+    // determinism gained.
+    const DeterministicScope detScope{params_.deterministic, this};
+
+    size_t nThreads = 1;
+    if (params_.parallel_icp_enabled)
+    {
+        const size_t slots = state_.perThreadState_.size();
+        // Auto (0): use ~1/4 of the cores. mp2p_icp already parallelizes each ICP
+        // internally with TBB, so one outer thread per core just oversubscribes
+        // the shared TBB pool; the measured speedup flattens out by ~cores/4.
+        //
+        // cores/4 stays the auto value under `deterministic` too. Taking all the
+        // slots instead was tried, on the theory that pinning the inner runtimes
+        // leaves nothing to oversubscribe, and measured WORSE on KITTI-07 (47-50 s
+        // against 40 s): the per-thread point-cloud cache is
+        // pc_cache_max_bytes/slots, so more slots means a smaller cache each and
+        // more clouds regenerated.
+        nThreads = params_.num_icp_threads == 0 ? std::max<size_t>(1, slots / 4)
+                                                : std::min(params_.num_icp_threads, slots);
+        nThreads = std::clamp<size_t>(nThreads, 1, std::max<size_t>(1, candidates.size()));
+    }
+
+    // Evaluate one candidate on ICP slot `slot`; returns the accepted edge (if
+    // any). A single degenerate candidate (e.g. a scan missing the registration
+    // layer, or an ICP that fails to converge) must never abort the whole scan:
+    // log and skip so the remaining candidates are still evaluated.
+    auto evalCandidate = [&](const LoopCandidate& lc, size_t slot,
+                             bool profile) -> std::optional<ProposedLoopEdge>
+    {
+        std::optional<LcIcpEdge> edge;
+        try
+        {
+            edge = run_lc_icp(lc, slot, profile);
+        }
+        catch (const std::exception& e)
+        {
+            MRPT_LOG_WARN_STREAM(
+                "Loop-closure candidate "
+                << lc.frame_i << " <-> " << lc.frame_j
+                << " skipped due to error: " << first_n_lines(e.what(), 2));
+            return std::nullopt;
+        }
+        if (!edge)
+        {
+            return std::nullopt;
+        }
+        ProposedLoopEdge pe;
+        pe.from          = lc.frame_i;
+        pe.to            = lc.frame_j;
+        pe.relative_pose = edge->relPose;
+        pe.quality       = edge->quality;
+        return pe;
+    };
+
+    if (nThreads <= 1)
+    {
+        // Sequential path (keeps per-candidate profiling).
+        for (const auto& lc : candidates)
+        {
+            // Poll for cancellation before the expensive ICP step.
+            if (opts.should_abort && opts.should_abort())
+            {
+                aborted = true;
+                break;
+            }
+            auto pe = evalCandidate(lc, /*slot=*/0, /*profile=*/true);
+            evaluated.fetch_add(1, std::memory_order_relaxed);
+            reportProgress();
+            if (!pe)
+            {
+                continue;
+            }
+            // Stream the edge to the consumer early, before the scan finishes.
+            if (opts.on_edge_found)
+            {
+                opts.on_edge_found(*pe);
+            }
+            out.push_back(*pe);
+        }
+    }
+    else
+    {
+        // Parallel path: each worker owns one ICP slot and pulls candidates from
+        // a shared atomic index. Edge streaming/collection is serialized under a
+        // mutex; the accepted-edge ORDER is therefore not deterministic, which
+        // the robust (GNC/Huber) graph downstream tolerates. Per-candidate
+        // profiling is off (CTimeLogger forbids one section across threads).
+        std::atomic<size_t> nextIdx{0};
+        std::mutex          outMtx;
+        auto                worker = [&](size_t slot)
+        {
+            while (!aborted.load(std::memory_order_relaxed))
+            {
+                if (opts.should_abort && opts.should_abort())
+                {
+                    aborted = true;
+                    break;
+                }
+                const size_t idx = nextIdx.fetch_add(1, std::memory_order_relaxed);
+                if (idx >= candidates.size())
+                {
+                    break;
+                }
+                auto pe = evalCandidate(candidates[idx], slot, /*profile=*/false);
+                evaluated.fetch_add(1, std::memory_order_relaxed);
+                // Only serialize when there is something to do under the lock:
+                // progress to report or an accepted edge to push. Rejected
+                // candidates (the common case) stay on the lock-free path.
+                if (opts.on_progress || pe)
+                {
+                    std::lock_guard<std::mutex> lk(outMtx);
+                    reportProgress();
+                    if (pe)
+                    {
+                        if (opts.on_edge_found)
+                        {
+                            opts.on_edge_found(*pe);
+                        }
+                        out.push_back(*pe);
+                    }
+                }
+            }
+        };
+
+        // Silence the profiler across the parallel region: several helpers
+        // (point-cloud generation, filter pipeline) time shared sections that
+        // CTimeLogger does not allow to be entered from multiple threads.
+        const bool profWasEnabled = profiler_.isEnabled();
+        profiler_.enable(false);
+
+        std::vector<std::future<void>> futs;
+        futs.reserve(nThreads);
+        for (size_t k = 0; k < nThreads; k++)
+        {
+            futs.emplace_back(threads_.enqueue(worker, k));
+        }
+        for (auto& f : futs)
+        {
+            f.get();
+        }
+
+        profiler_.enable(profWasEnabled);
+    }
+
+    // A canonical order on the way out. The sequential path already produces
+    // candidate order, but a consumer folding these into a factor graph often
+    // drops a pair it has already closed, which makes the order observable --
+    // so state it here rather than leaving each consumer to sort defensively.
+    if (params_.deterministic)
+    {
+        std::sort(
+            out.begin(), out.end(),
+            [](const ProposedLoopEdge& a, const ProposedLoopEdge& b)
+            { return std::minmax(a.from, a.to) < std::minmax(b.from, b.to); });
+    }
+
+    MRPT_LOG_INFO_STREAM(
+        "analyze(): accepted " << out.size() << " loop closure edges"
+                               << (aborted ? " (aborted early)" : "")
+                               << (params_.deterministic ? " [deterministic]" : ""));
+
+    if (opts.out_stats)
+    {
+        opts.out_stats->candidates_generated = candidatesTotal;
+        opts.out_stats->candidates_evaluated = evaluated.load(std::memory_order_relaxed);
+        opts.out_stats->edges_accepted       = out.size();
+        opts.out_stats->aborted              = aborted.load();
+    }
+
+    // state_.sm is cleared by snapshotGuard on scope exit.
+    return out;
 }
 
 mp2p_icp::metric_map_t::Ptr FrameToFrameLoopClosure::generate_frame_pointcloud(
@@ -1485,8 +1917,25 @@ mp2p_icp::metric_map_t::Ptr FrameToFrameLoopClosure::generate_frame_pointcloud(
     // Apply filters
     mp2p_icp_filters::apply_filter_pipeline(pts.pipeline.pc_filter, *observation, profiler_);
 
-    // Unload raw observation data to free RAM (only effective for externally-stored data)
-    if (params_.unload_observations_after_use)
+    // Some keyframes filter down to an empty cloud (e.g. a near-empty or
+    // heavily-occluded scan, or a dataset whose extremes fall outside the
+    // range/bounding-box filters): the ICP registration layers then end up
+    // missing or empty. Treat such a frame as unusable and return an empty
+    // result so the caller skips this loop-closure candidate, instead of
+    // aborting the whole background scan when align() later fails to find its
+    // input layers.
+    if (observation->size_points_only() == 0)
+    {
+        MRPT_LOG_WARN_STREAM(
+            "Frame " << frameId
+                     << ": generated an empty point cloud; skipping it as a loop-closure "
+                        "candidate.");
+        return {};
+    }
+
+    // Unload raw observation data to free RAM (only effective for externally-stored data).
+    // Skipped in the read-only analyze() flow, which must not mutate the snapshot.
+    if (params_.unload_observations_after_use && !state_.readOnlySnapshot)
     {
         for (const auto& obs : *sf)
         {
@@ -1509,17 +1958,20 @@ mp2p_icp::metric_map_t::Ptr FrameToFrameLoopClosure::get_cached_pointcloud(
         return generate_frame_pointcloud(frameId, threadIdx);
     }
 
+    // Each thread owns its own cache slot, so no locking is needed and two
+    // candidates never share a cloud (which would race its lazy KD-tree).
+    auto& pts = state_.perThreadState_.at(threadIdx);
+
     // Cache hit?
-    auto it = state_.pcCache.find(frameId);
-    if (it != state_.pcCache.end())
+    auto it = pts.pcCache.find(frameId);
+    if (it != pts.pcCache.end())
     {
-        // Move to front of LRU list
-        state_.pcLruOrder.remove(frameId);
-        state_.pcLruOrder.push_front(frameId);
+        pts.pcLruOrder.remove(frameId);  // move to front of LRU list
+        pts.pcLruOrder.push_front(frameId);
         return it->second.pc;
     }
 
-    // Cache miss: generate the point cloud
+    // Cache miss: generate the point cloud.
     auto pc = generate_frame_pointcloud(frameId, threadIdx);
     if (!pc)
     {
@@ -1533,10 +1985,10 @@ mp2p_icp::metric_map_t::Ptr FrameToFrameLoopClosure::get_cached_pointcloud(
         if (map)
         {
             // Use the number of points * approximate bytes per point
-            auto pts = std::dynamic_pointer_cast<mrpt::maps::CPointsMap>(map);
-            if (pts)
+            auto ptsMap = std::dynamic_pointer_cast<mrpt::maps::CPointsMap>(map);
+            if (ptsMap)
             {
-                approxBytes += pts->size() * (3 * sizeof(float) + 16);  // xyz + overhead
+                approxBytes += ptsMap->size() * (3 * sizeof(float) + 16);  // xyz + overhead
             }
         }
     }
@@ -1545,29 +1997,31 @@ mp2p_icp::metric_map_t::Ptr FrameToFrameLoopClosure::get_cached_pointcloud(
         approxBytes = 1024;  // minimum estimate
     }
 
-    // Insert into cache
-    state_.pcCache[frameId] = {pc, approxBytes};
-    state_.pcLruOrder.push_front(frameId);
-    state_.pcCacheTotalBytes += approxBytes;
-
-    // Evict if over budget
-    evict_pc_cache();
+    // Insert into this thread's cache.
+    pts.pcCache[frameId] = {pc, approxBytes};
+    pts.pcLruOrder.push_front(frameId);
+    pts.pcCacheTotalBytes += approxBytes;
+    evict_pc_cache(pts);
 
     return pc;
 }
 
-void FrameToFrameLoopClosure::evict_pc_cache()
+void FrameToFrameLoopClosure::evict_pc_cache(PerThreadState& pts)
 {
-    while (state_.pcCacheTotalBytes > params_.pc_cache_max_bytes && !state_.pcLruOrder.empty())
+    // Budget is divided across the ICP slots so the total cache footprint stays
+    // close to pc_cache_max_bytes regardless of the worker-thread count.
+    const size_t budget =
+        std::max<size_t>(1, params_.pc_cache_max_bytes / state_.perThreadState_.size());
+    while (pts.pcCacheTotalBytes > budget && !pts.pcLruOrder.empty())
     {
-        const auto oldestId = state_.pcLruOrder.back();
-        state_.pcLruOrder.pop_back();
+        const auto oldestId = pts.pcLruOrder.back();
+        pts.pcLruOrder.pop_back();
 
-        auto it = state_.pcCache.find(oldestId);
-        if (it != state_.pcCache.end())
+        auto it = pts.pcCache.find(oldestId);
+        if (it != pts.pcCache.end())
         {
-            state_.pcCacheTotalBytes -= it->second.approxBytes;
-            state_.pcCache.erase(it);
+            pts.pcCacheTotalBytes -= it->second.approxBytes;
+            pts.pcCache.erase(it);
         }
     }
 }
@@ -1694,7 +2148,7 @@ void FrameToFrameLoopClosure::save_3d_scene_initial_files() const
 
     // 1) Initial path edges
     {
-        auto lines = mrpt::opengl::CSetOfLines::Create();
+        auto lines = mrpt::viz::CSetOfLines::Create();
         lines->setLineWidth(params_.scene_path_line_width);
         lines->setColor_u8(pathColor);
 
@@ -1705,7 +2159,7 @@ void FrameToFrameLoopClosure::save_3d_scene_initial_files() const
             lines->appendLine(p0, p1);
         }
 
-        mrpt::opengl::Scene scene;
+        mrpt::viz::Scene scene;
         scene.insert(lines);
         const auto fn = prefix + "initial_path_edges.3Dscene";
         if (scene.saveToFile(fn))
@@ -1720,7 +2174,7 @@ void FrameToFrameLoopClosure::save_3d_scene_initial_files() const
 
     // 2) Initial keyframe points
     {
-        auto pts = mrpt::opengl::CPointCloud::Create();
+        auto pts = mrpt::viz::CPointCloud::Create();
         pts->setPointSize(params_.scene_keyframe_point_size);
         pts->setColor_u8(pathColor);
 
@@ -1730,7 +2184,7 @@ void FrameToFrameLoopClosure::save_3d_scene_initial_files() const
             pts->insertPoint(p);
         }
 
-        mrpt::opengl::Scene scene;
+        mrpt::viz::Scene scene;
         scene.insert(pts);
         const auto fn = prefix + "initial_keyframe_points.3Dscene";
         if (scene.saveToFile(fn))
@@ -1752,7 +2206,7 @@ void FrameToFrameLoopClosure::save_3d_scene_files(const std::string& suffix) con
 
     // 1) Path edges: lines connecting consecutive keyframes
     {
-        auto lines = mrpt::opengl::CSetOfLines::Create();
+        auto lines = mrpt::viz::CSetOfLines::Create();
         lines->setLineWidth(params_.scene_path_line_width);
         lines->setColor_u8(mrpt::img::TColorf(
                                params_.scene_path_color_r, params_.scene_path_color_g,
@@ -1766,7 +2220,7 @@ void FrameToFrameLoopClosure::save_3d_scene_files(const std::string& suffix) con
             lines->appendLine(p0, p1);
         }
 
-        mrpt::opengl::Scene scene;
+        mrpt::viz::Scene scene;
         scene.insert(lines);
         const auto fn = prefix + "path_edges.3Dscene";
         if (scene.saveToFile(fn))
@@ -1781,7 +2235,7 @@ void FrameToFrameLoopClosure::save_3d_scene_files(const std::string& suffix) con
 
     // 2) Keyframe points
     {
-        auto pts = mrpt::opengl::CPointCloud::Create();
+        auto pts = mrpt::viz::CPointCloud::Create();
         pts->setPointSize(params_.scene_keyframe_point_size);
         pts->setColor_u8(mrpt::img::TColorf(
                              params_.scene_path_color_r, params_.scene_path_color_g,
@@ -1794,7 +2248,7 @@ void FrameToFrameLoopClosure::save_3d_scene_files(const std::string& suffix) con
             pts->insertPoint(p);
         }
 
-        mrpt::opengl::Scene scene;
+        mrpt::viz::Scene scene;
         scene.insert(pts);
         const auto fn = prefix + "keyframe_points.3Dscene";
         if (scene.saveToFile(fn))
@@ -1809,7 +2263,7 @@ void FrameToFrameLoopClosure::save_3d_scene_files(const std::string& suffix) con
 
     // 3) Loop closure edges
     {
-        auto lines = mrpt::opengl::CSetOfLines::Create();
+        auto lines = mrpt::viz::CSetOfLines::Create();
         lines->setLineWidth(params_.scene_lc_line_width);
         lines->setColor_u8(mrpt::img::TColorf(
                                params_.scene_lc_color_r, params_.scene_lc_color_g,
@@ -1823,7 +2277,7 @@ void FrameToFrameLoopClosure::save_3d_scene_files(const std::string& suffix) con
             lines->appendLine(p0, p1);
         }
 
-        mrpt::opengl::Scene scene;
+        mrpt::viz::Scene scene;
         scene.insert(lines);
         const auto fn = prefix + "lc_edges.3Dscene";
         if (scene.saveToFile(fn))
@@ -1850,7 +2304,7 @@ void FrameToFrameLoopClosure::save_3d_scene_live_preview(
     ASSERT_(state_.sm);
     const auto& sm = *state_.sm;
 
-    mrpt::opengl::Scene scene;
+    mrpt::viz::Scene scene;
 
     // Ground grid spanning the trajectory bounding box
     {
@@ -1877,14 +2331,14 @@ void FrameToFrameLoopClosure::save_3d_scene_live_preview(
         yMin = std::floor((yMin - MARGIN) / GRID_SPACING) * GRID_SPACING;
         yMax = std::ceil((yMax + MARGIN) / GRID_SPACING) * GRID_SPACING;
 
-        auto grid = mrpt::opengl::CGridPlaneXY::Create(xMin, xMax, yMin, yMax, 0.0f, GRID_SPACING);
+        auto grid = mrpt::viz::CGridPlaneXY::Create(xMin, xMax, yMin, yMax, 0.0f, GRID_SPACING);
         grid->setColor(0.5f, 0.5f, 0.5f, 0.5f);
         scene.insert(grid);
     }
 
     // Trajectory path edges
     {
-        auto lines = mrpt::opengl::CSetOfLines::Create();
+        auto lines = mrpt::viz::CSetOfLines::Create();
         lines->setLineWidth(params_.scene_path_line_width);
         lines->setColor_u8(mrpt::img::TColorf(
                                params_.scene_path_color_r, params_.scene_path_color_g,
@@ -1900,7 +2354,7 @@ void FrameToFrameLoopClosure::save_3d_scene_live_preview(
 
     // Keyframe positions
     {
-        auto pts = mrpt::opengl::CPointCloud::Create();
+        auto pts = mrpt::viz::CPointCloud::Create();
         pts->setPointSize(params_.scene_keyframe_point_size);
         pts->setColor_u8(mrpt::img::TColorf(
                              params_.scene_path_color_r, params_.scene_path_color_g,
@@ -1916,7 +2370,7 @@ void FrameToFrameLoopClosure::save_3d_scene_live_preview(
     // Accepted LC edges (green)
     if (!accepted_lc_edges_.empty())
     {
-        auto lines = mrpt::opengl::CSetOfLines::Create();
+        auto lines = mrpt::viz::CSetOfLines::Create();
         lines->setLineWidth(params_.scene_lc_line_width);
         lines->setColor_u8(mrpt::img::TColorf(
                                params_.scene_lc_color_r, params_.scene_lc_color_g,
@@ -1932,7 +2386,7 @@ void FrameToFrameLoopClosure::save_3d_scene_live_preview(
     // Pending candidate LC edges (orange)
     if (!pendingCandidates.empty())
     {
-        auto lines = mrpt::opengl::CSetOfLines::Create();
+        auto lines = mrpt::viz::CSetOfLines::Create();
         lines->setLineWidth(params_.scene_lc_line_width);
         lines->setColor_u8(
             mrpt::img::TColorf(
@@ -1955,7 +2409,7 @@ void FrameToFrameLoopClosure::save_3d_scene_live_preview(
         const auto gnssFrames = extract_gnss_frames_from_sm(*state_.sm, state_.globalGeoRef);
         if (!gnssFrames.frames.empty())
         {
-            auto pts = mrpt::opengl::CPointCloud::Create();
+            auto pts = mrpt::viz::CPointCloud::Create();
             pts->setPointSize(3.0f);
             pts->setColor_u8(mrpt::img::TColor(0, 220, 220, 128));  // cyan, alpha=50%
             for (const auto& gf : gnssFrames.frames)
@@ -1971,7 +2425,7 @@ void FrameToFrameLoopClosure::save_3d_scene_live_preview(
     {
         auto vp = scene.getViewport("main");
 
-        mrpt::opengl::TFontParams fp;
+        mrpt::viz::TFontParams fp;
         fp.vfont_name  = "sans";
         fp.vfont_scale = 14.0f;
         fp.draw_shadow = true;
