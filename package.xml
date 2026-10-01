@@ -5,7 +5,7 @@
 -->
 <package format="3">
   <name>mola_sm_loop_closure</name>
-  <version>1.2.2</version>
+  <version>1.3.0</version>
   <description>Simplemap loop-closure postprocessing library and CLI tool</description>
 
   <maintainer email="joseluisblancoc@gmail.com">Jose-Luis Blanco-Claraco</maintainer>
@@ -25,9 +25,9 @@
   <depend>mola_relocalization</depend>
   <depend>mola_yaml</depend>
   <depend>mp2p_icp</depend>
-  <depend>mrpt_libgui</depend>
-  <depend>mrpt_libmaps</depend>
-  <depend>mrpt_libtclap</depend>
+  <depend>mrpt_maps</depend>
+  <depend>mrpt_viz</depend>
+  <depend>cli11</depend>
   <depend>tbb</depend>
 
   <doc_depend>doxygen</doc_depend>
