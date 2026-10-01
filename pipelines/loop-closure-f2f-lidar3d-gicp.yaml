@@ -18,7 +18,10 @@ params:
   gnss_edges_uncertainty_multiplier: "${GNSS_EDGES_UNCERTAINTY_MULTIPLIER|1.0}"
 
   # ===== Loop Closure Candidate Selection =====
-  min_distance_between_frames: "${MIN_LC_DISTANCE|2.0}" # [m] Min spatial separation
+  # Min spatial separation, in the CURRENT ESTIMATE, so a non-zero value
+  # rejects real revisits on any odometry accurate enough to place them
+  # where they are. Keyframe adjacency is min_frames_between_lc's job.
+  min_distance_between_frames: "${MIN_LC_DISTANCE|0.0}" # [m]
   max_distance_for_lc_candidate: "${MAX_LC_DISTANCE|50.0}" # [m] Max distance to consider
   max_lc_candidates: "${MAX_LC_CANDIDATES|20}" # Maximum candidates per iteration
   min_frames_between_lc: "${MIN_FRAMES_BETWEEN_LC|20}" # Minimum frame index separation
@@ -44,6 +47,31 @@ params:
   icp_edge_additional_noise_ang: 0.1 # [deg] Additional angular uncertainty
   threshold_sigma_initial: "${LC_ICP_INITIAL_SIGMA|1.0}"
   threshold_sigma_final: "${LC_ICP_FINAL_SIGMA|0.05}"
+
+  # Evaluate loop-closure candidates concurrently (each worker uses its own ICP
+  # pipeline slot). Candidates are independent pairwise registrations, so this
+  # speeds up both live scans and the finalize pass ~linearly with core count.
+  parallel_icp_enabled: "${LC_PARALLEL_ICP|true}"
+  # 0 = auto (~cores/4). Each ICP already uses TBB internally, so one outer
+  # thread per core just oversubscribes; speedup flattens by ~cores/4.
+  num_icp_threads: "${LC_NUM_ICP_THREADS|0}"
+
+  # Reproducible scan: same simplemap in, same edges out -- provided the build
+  # could pin the runtimes it relies on. TBB and OpenMP are optional at build
+  # time; if one that is actually in use was not found by CMake, the engine warns
+  # at scan time and the guarantee does not hold.
+  #
+  # Overrides the two settings above (no need to also turn parallel_icp_enabled
+  # off) AND pins the parallel runtimes underneath this library for the duration
+  # of the scan -- mp2p_icp's TBB reductions, which otherwise decide both the
+  # order of the correspondence list and the summation order of the
+  # Gauss-Newton normal equations, and KISS-Matcher's TBB and OpenMP regions.
+  # Turning parallel_icp_enabled off alone reaches none of those.
+  #
+  # Costs wall clock: it is one thread all the way down. Leave it off for live
+  # SLAM, where the answer has to be good rather than repeatable; turn it on for
+  # a batch run whose numbers will be compared against another run.
+  deterministic: "${LC_DETERMINISTIC|false}"
 
   # ===== Odometry Edge Parameters =====
   input_odometry_noise_xyz: "${INPUT_ODOMETRY_NOISE_XYZ_PER_M|0.04}" # [m] Odometry translational noise (per meter of travel if scaled)
