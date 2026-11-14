@@ -5,7 +5,7 @@
 -->
 <package format="3">
   <name>mola_sm_loop_closure</name>
-  <version>1.3.1</version>
+  <version>1.4.0</version>
   <description>Simplemap loop-closure postprocessing library and CLI tool</description>
 
   <maintainer email="joseluisblancoc@gmail.com">Jose-Luis Blanco-Claraco</maintainer>
@@ -20,12 +20,13 @@
   <depend>gtsam</depend>
   <depend>mola_common</depend>
   <depend>mola_georeferencing</depend>
-  <depend>mola_gtsam_factors</depend>
+  <depend version_gte="3.0.0">mola_gtsam_factors</depend> <!-- MapGravityFactor -->
   <depend>mola_pose_list</depend>
   <depend>mola_relocalization</depend>
   <depend>mola_yaml</depend>
   <depend>mp2p_icp</depend>
   <depend>mrpt_maps</depend>
+  <depend>mrpt_poses</depend>
   <depend>mrpt_viz</depend>
   <depend>cli11</depend>
   <depend>tbb</depend>
