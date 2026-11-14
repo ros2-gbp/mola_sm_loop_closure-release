@@ -18,6 +18,7 @@
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
 #include <gtsam/nonlinear/Values.h>
 #include <mola_sm_loop_closure/LoopClosureInterface.h>
+#include <mola_sm_loop_closure/common/gnss_factor_helpers.h>
 #include <mola_sm_loop_closure/common/icp_pipeline_setup.h>
 #include <mp2p_icp/icp_pipeline_from_yaml.h>
 #include <mp2p_icp/metricmap.h>
@@ -32,6 +33,7 @@
 #include <mrpt/typemeta/TEnumType.h>
 #include <mrpt/viz/CSetOfObjects.h>
 
+#include <atomic>
 #include <list>
 #include <mutex>
 #include <set>
@@ -85,6 +87,13 @@ class FrameToFrameLoopClosure : public mola::LoopClosureInterface
         double gnss_edges_uncertainty_multiplier = 1.0;
         double gnss_max_uncertainty_horiz = 20.0;  // [m] reject if sqrt(sigE²+sigN²) > this
         double gnss_max_uncertainty_vert  = 40.0;  // [m] reject if sigU > this
+
+        /** If true, before adding the GNSS factors, move the initial guess of all
+         *  keyframes by the yaw + translation that best fits their GNSS readings.
+         *  The input odometry frame is otherwise an arbitrary initial guess for the
+         *  {enu} frame, which a stiff odometry (low input_odometry_noise_*) cannot
+         *  rotate into place within the optimizer. */
+        bool gnss_initial_alignment = true;
 
         /** If true, add per-keyframe IMU gravity-alignment factors
          *  (mola::factors::MeasuredGravityFactor) constraining roll/pitch against the
@@ -369,6 +378,11 @@ class FrameToFrameLoopClosure : public mola::LoopClosureInterface
     {
         bool initialized = false;
 
+        /// Candidate ICP runs that completed or threw: a run where every one
+        /// throws is a configuration error, not degenerate candidates.
+        std::atomic<std::size_t> lcIcpCompleted{0};
+        std::atomic<std::size_t> lcIcpFailed{0};
+
         const mrpt::maps::CSimpleMap* sm = nullptr;
 
         /// True while running the detector-only analyze() over a caller-owned
@@ -396,6 +410,9 @@ class FrameToFrameLoopClosure : public mola::LoopClosureInterface
         // Indices of factors known to be inliers (prior, odometry, GNSS)
         // for use with GNC optimizer
         std::vector<uint64_t> knownInlierFactorIndices;
+
+        /// Index in graphFG of the prior on the first keyframe
+        std::size_t firstPosePriorFactorIndex = 0;
 
         /// Precomputed flag per frame: true if the frame has mapping-capable
         /// observations.  Computed once at the start of process() to avoid
@@ -438,6 +455,15 @@ class FrameToFrameLoopClosure : public mola::LoopClosureInterface
     /** Add GNSS factors to the graph */
     void add_gnss_factors();
 
+    /** GNSS factor parameters, from params_ */
+    lc_common::GnssFactorParams gnss_factor_params() const;
+
+    /** See Parameters::gnss_initial_alignment */
+    void align_initial_values_to_gnss();
+
+    /** Sigma of the prior on the first keyframe (all 6 dims) */
+    double first_pose_prior_sigma() const;
+
     /** Adds per-keyframe IMU gravity-alignment factors (see Parameters::use_imu_gravity). */
     /// Returns true if at least one IMU gravity-alignment factor was added.
     bool add_imu_gravity_factors();
@@ -449,14 +475,22 @@ class FrameToFrameLoopClosure : public mola::LoopClosureInterface
         double               distance        = 0.0;  // estimated distance between frames
         double               score           = 0.0;  // candidate quality score
         mrpt::math::TPoint3D spatialMidpoint = {0, 0, 0};  // (pose_i + pose_j) / 2
+        /// Its block pair holds an excluded pair (a place already closed or
+        /// rejected): it ranks after the pairs of other block pairs.
+        bool in_excluded_block = false;
     };
 
     /** Find potential loop closure candidates.
+     *  \param alreadyChecked Block pairs (see min_frames_between_lc) to skip.
      *  \param minLaterFrame If >0, only generate pairs whose later frame index
-     *         is >= this value (used for incremental, new-keyframe-only scans). */
+     *         is >= this value (used for incremental, new-keyframe-only scans).
+     *  \param excludedFramePairs Keyframe pairs (min,max) to skip; the other
+     *         pairs of their block pairs remain candidates, ranked after those
+     *         of other block pairs. */
     std::vector<LoopCandidate> find_loop_candidates(
         const std::set<std::pair<frame_id_t, frame_id_t>>& alreadyChecked,
-        frame_id_t                                         minLaterFrame = 0) const;
+        frame_id_t                                         minLaterFrame      = 0,
+        const std::set<std::pair<frame_id_t, frame_id_t>>* excludedFramePairs = nullptr) const;
 
     /** Result of running ICP on one loop-closure candidate: the relative pose
      *  edge (i -> j) with the same diagonal, additive-noise-inflated covariance

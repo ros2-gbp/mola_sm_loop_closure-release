@@ -22,6 +22,7 @@
 #include <mola_sm_loop_closure/common/icp_pipeline_setup.h>
 #include <mola_sm_loop_closure/common/tum_writer.h>
 #include <mp2p_icp/update_velocity_buffer_from_obs.h>
+#include <mrpt/core/exceptions.h>
 #include <mrpt/core/get_env.h>
 #include <mrpt/obs/CObservation2DRangeScan.h>
 #include <mrpt/obs/CObservation3DRangeScan.h>
@@ -37,6 +38,8 @@
 #include <mrpt/random/RandomGenerators.h>
 #include <mrpt/system/filesystem.h>
 #include <mrpt/viz/CEllipsoid2D.h>
+
+#include "common/mrpt_gtsam_compat.h"
 
 // MOLA:
 #include <mola_relocalization/relocalization.h>
@@ -68,6 +71,12 @@
 #include <gtsam/slam/expressions.h>
 
 using namespace mola;
+
+namespace
+{
+// Loop-closure ICP runs that may throw before any one succeeds.
+constexpr std::size_t MAX_LC_ICP_FAILURES_WITHOUT_SUCCESS = 10;
+}  // namespace
 
 IMPLEMENTS_SERIALIZABLE(SimplemapLoopClosure, LoopClosureInterface, mola)
 
@@ -409,10 +418,11 @@ void SimplemapLoopClosure::process(mrpt::maps::CSimpleMap& sm)
             // 2) Add edge to low-level keyframe graph (submap strategy only):
             if (params_.gnss_factor_strategy == "submap")
             {
-                const gtsam::Pose3 deltaPose = mrpt::gtsam_wrappers::toPose3(relPose.getPoseMean());
+                gtsam::Pose3   deltaPose;
+                gtsam::Matrix6 deltaCov;
+                mola::gtsam_compat::to_gtsam_se3_cov6(relPose, deltaPose, deltaCov);
 
-                auto edgeNoise = gtsam::noiseModel::Gaussian::Covariance(
-                    mrpt::gtsam_wrappers::to_gtsam_se3_cov6_reordering(relPose.cov));
+                auto edgeNoise = gtsam::noiseModel::Gaussian::Covariance(deltaCov);
 
                 const auto refKfId = *refSubmap.kf_ids.begin();
                 const auto curKfId = *submap.kf_ids.begin();
@@ -420,8 +430,7 @@ void SimplemapLoopClosure::process(mrpt::maps::CSimpleMap& sm)
                 MRPT_LOG_DEBUG_STREAM(
                     "GNSS edge #" << refKfId << " => #" << curKfId << " relPose: " << relPose
                                   << "\n gtsam:" << deltaPose << "\n cov:\n"
-                                  << mrpt::gtsam_wrappers::to_gtsam_se3_cov6_reordering(
-                                         relPose.cov));
+                                  << deltaCov);
 
                 {
                     const auto p0 = state_.kfGraphValues.at<gtsam::Pose3>(X(refKfId));
@@ -716,8 +725,10 @@ void SimplemapLoopClosure::process(mrpt::maps::CSimpleMap& sm)
         {
             try
             {
-                newPose->cov = mrpt::gtsam_wrappers::to_mrpt_se3_cov6(
-                    state_.kfGraphMarginals->marginalCovariance(X(id)));
+                newPose->cov = mola::gtsam_compat::to_mrpt_se3_pdf(
+                                   state_.kfGraphValues.at<gtsam::Pose3>(X(id)),
+                                   state_.kfGraphMarginals->marginalCovariance(X(id)))
+                                   .cov;
             }
             catch (const std::exception& e)
             {
@@ -1465,19 +1476,22 @@ bool SimplemapLoopClosure::process_loop_candidate(const PotentialLoop& lc)
         using gtsam::symbol_shorthand::X;
 
         // Single LC edge with real ICP cov + extra noise; GNC handles outlier rejection.
-        gtsam::Vector6 realSigmasXYZYPR = icpRelPose.cov.asEigen().diagonal().array().sqrt().eval();
-
-        for (int i = 0; i < 3; i++)
+        // MRPT covariance order: x y z yaw pitch roll. The extra noise inflates
+        // each sigma and keeps the correlations of the ICP covariance:
+        mrpt::poses::CPose3DPDFGaussian inflated = icpRelPose;
+        for (int i = 0; i < 6; i++)
         {
-            realSigmasXYZYPR[3 + i] += params_.icp_edge_additional_noise_xyz;
-            realSigmasXYZYPR[i] += mrpt::DEG2RAD(params_.icp_edge_additional_noise_ang_deg);
+            const double extra = i < 3 ? params_.icp_edge_additional_noise_xyz
+                                       : mrpt::DEG2RAD(params_.icp_edge_additional_noise_ang_deg);
+            inflated.cov(i, i) = mrpt::square(std::sqrt(icpRelPose.cov(i, i)) + extra);
         }
 
-        gtsam::Vector6 realSigmasGtsam;
-        realSigmasGtsam << realSigmasXYZYPR[5], realSigmasXYZYPR[4], realSigmasXYZYPR[3],
-            realSigmasXYZYPR[0], realSigmasXYZYPR[1], realSigmasXYZYPR[2];
+        // Into the GTSAM tangent of the relative pose, rotation included:
+        gtsam::Pose3   unusedPose;
+        gtsam::Matrix6 icpEdgeCov;
+        mola::gtsam_compat::to_gtsam_se3_cov6(inflated, unusedPose, icpEdgeCov);
 
-        auto icpEdgeNoise = gtsam::noiseModel::Diagonal::Sigmas(realSigmasGtsam);
+        auto icpEdgeNoise = gtsam::noiseModel::Gaussian::Covariance(icpEdgeCov);
 
         state_.kfGraphFG.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(
             X(*submapGlobal.kf_ids.begin()), X(*submapLocal.kf_ids.begin()), deltaPose,
@@ -1675,38 +1689,59 @@ bool SimplemapLoopClosure::process_loop_candidate(const PotentialLoop& lc)
             << " corner_min=" << in.initial_guess_lattice.corner_min
             << " corner_max=" << in.initial_guess_lattice.corner_max);
 
-        const auto out = mola::RelocalizationICP_SE2::run(in);
-
-        // search top candidates:
-
-        // Take the voxel with the largest number of poses:
-        std::map<size_t, mrpt::math::TPose3D> bestVoxels;
-
-        out.found_poses.visitAllVoxels(
-            [&](const mola::HashedSetSE3::global_index3d_t&, const mola::HashedSetSE3::VoxelData& v)
-            {
-                if (v.poses().empty())
-                {
-                    return;
-                }
-                bestVoxels[v.poses().size()] = v.poses().front();
-            });
-
-        if (!bestVoxels.empty())
+        std::optional<mola::RelocalizationICP_SE2::Output> mcOut;
+        try
         {
-            const auto& bestPose = bestVoxels.rbegin()->second;
+            mcOut = mola::RelocalizationICP_SE2::run(in);
+        }
+        catch (const std::exception& e)
+        {
+            // Same as a failed ICP below: fall back to the default guesses.
+            if (state_.lcIcpCompleted == 0 &&
+                ++state_.lcIcpFailed >= MAX_LC_ICP_FAILURES_WITHOUT_SUCCESS)
+            {
+                throw;
+            }
+            MRPT_LOG_WARN_STREAM(
+                "[Relocalize SE(2)] failed, using the default initial guesses: "
+                << mrpt::exception_to_str(e));
+        }
+        if (mcOut)
+        {
+            const auto& out = *mcOut;
+
+            // search top candidates:
+
+            // Take the voxel with the largest number of poses:
+            std::map<size_t, mrpt::math::TPose3D> bestVoxels;
+
+            out.found_poses.visitAllVoxels(
+                [&](const mola::HashedSetSE3::global_index3d_t&,
+                    const mola::HashedSetSE3::VoxelData& v)
+                {
+                    if (v.poses().empty())
+                    {
+                        return;
+                    }
+                    bestVoxels[v.poses().size()] = v.poses().front();
+                });
+
+            if (!bestVoxels.empty())
+            {
+                const auto& bestPose = bestVoxels.rbegin()->second;
 #if 0
             lambdaAddIcpEdge(mrpt::poses::CPose3D(bestPose), 1.0);
             // ...
             return true;  // done
 #endif
-            MRPT_LOG_INFO_STREAM(
-                "[Relocalize SE(2)] Result has "
-                << out.found_poses.voxels().size() << " voxels, most populated one |V|="
-                << bestVoxels.rbegin()->first << " bestPose: " << bestPose);
+                MRPT_LOG_INFO_STREAM(
+                    "[Relocalize SE(2)] Result has "
+                    << out.found_poses.voxels().size() << " voxels, most populated one |V|="
+                    << bestVoxels.rbegin()->first << " bestPose: " << bestPose);
 
-            // Let ICP to run again to recover the covariance.
-            initGuesses.push_back(bestPose);
+                // Let ICP to run again to recover the covariance.
+                initGuesses.push_back(bestPose);
+            }
         }
     }
 
@@ -1778,8 +1813,28 @@ bool SimplemapLoopClosure::process_loop_candidate(const PotentialLoop& lc)
         updatePipelineDynamicVariablesForKeyframe(
             *submapLocal.kf_ids.begin(), *submapLocal.kf_ids.begin(), threadIdx);
 
-        pts.pipeline.icp->align(
-            pcs_local, pcs_global, initPose, params_.icp_parameters, icp_result);
+        try
+        {
+            pts.pipeline.icp->align(
+                pcs_local, pcs_global, initPose, params_.icp_parameters, icp_result);
+        }
+        catch (const std::exception& e)
+        {
+            // A degenerate registration (e.g. too few pairings for a valid
+            // covariance) rejects this initial guess, not the whole run. If no
+            // ICP has ever succeeded, the ICP setup itself is broken.
+            if (state_.lcIcpCompleted == 0 &&
+                ++state_.lcIcpFailed >= MAX_LC_ICP_FAILURES_WITHOUT_SUCCESS)
+            {
+                MRPT_LOG_ERROR_STREAM(
+                    "All " << state_.lcIcpFailed << " loop-closure ICP runs failed: aborting.");
+                throw;
+            }
+            MRPT_LOG_WARN_STREAM(
+                "ICP failed, initial guess rejected: " << mrpt::exception_to_str(e));
+            continue;
+        }
+        state_.lcIcpCompleted++;
 
         MRPT_LOG_INFO_FMT(
             "ICP: goodness=%6.01f%% iters=%u pose=%s "
