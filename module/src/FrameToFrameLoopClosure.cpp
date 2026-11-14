@@ -31,6 +31,7 @@
 #include <mola_sm_loop_closure/common/tum_writer.h>
 #include <mola_yaml/yaml_helpers.h>
 #include <mp2p_icp/update_velocity_buffer_from_obs.h>
+#include <mrpt/core/exceptions.h>
 #include <mrpt/core/get_env.h>
 #include <mrpt/maps/CPointsMap.h>
 #include <mrpt/obs/CObservation2DRangeScan.h>
@@ -51,6 +52,8 @@
 #include <mrpt/viz/Viewport.h>
 #include <mrpt/viz/opengl_fonts.h>
 
+#include "common/mrpt_gtsam_compat.h"
+
 #ifdef MOLA_HAS_KISS_MATCHER
 #include <kiss_matcher/KISSMatcher.hpp>
 #endif
@@ -67,6 +70,12 @@
 #include "DeterministicScope.h"
 
 using namespace mola;
+
+namespace
+{
+// Loop-closure ICP runs that may throw before any one succeeds.
+constexpr std::size_t MAX_LC_ICP_FAILURES_WITHOUT_SUCCESS = 10;
+}  // namespace
 
 IMPLEMENTS_SERIALIZABLE(FrameToFrameLoopClosure, LoopClosureInterface, mola)
 
@@ -210,6 +219,13 @@ std::string first_n_lines(const std::string& input, std::size_t n)
     return input.substr(0, pos);
 }
 
+/** The block of keyframes a keyframe belongs to: loop candidates are selected,
+ *  evaluated and excluded per pair of blocks, of about `group` keyframes each. */
+uint32_t frame_group_of(std::size_t i, std::size_t group)
+{
+    return static_cast<uint32_t>(mrpt::round(static_cast<double>(i) / static_cast<double>(group)));
+}
+
 }  // namespace
 
 FrameToFrameLoopClosure::FrameToFrameLoopClosure()
@@ -232,6 +248,7 @@ void FrameToFrameLoopClosure::initialize(const mrpt::containers::yaml& c)
     YAML_LOAD_OPT(params_, gnss_edges_uncertainty_multiplier, double);
     YAML_LOAD_OPT(params_, gnss_max_uncertainty_horiz, double);
     YAML_LOAD_OPT(params_, gnss_max_uncertainty_vert, double);
+    YAML_LOAD_OPT(params_, gnss_initial_alignment, bool);
 
     YAML_LOAD_OPT(params_, use_imu_gravity, bool);
     YAML_LOAD_OPT(params_, imu_gravity_sigma_deg, double);
@@ -463,6 +480,10 @@ void FrameToFrameLoopClosure::process(mrpt::maps::CSimpleMap& sm)  // NOLINT
     // Add GNSS factors if available
     if (params_.use_gnss)
     {
+        if (params_.gnss_initial_alignment)
+        {
+            align_initial_values_to_gnss();
+        }
         add_gnss_factors();
 
         // Initial optimization with GNSS
@@ -573,8 +594,7 @@ void FrameToFrameLoopClosure::process(mrpt::maps::CSimpleMap& sm)  // NOLINT
                 return std::min(a.frame_i, a.frame_j) < std::min(b.frame_i, b.frame_j);
             });
 
-        const auto frameGroup           = static_cast<double>(params_.min_frames_between_lc);
-        size_t     acceptedSinceLastOpt = 0;
+        size_t acceptedSinceLastOpt = 0;
 
         LivePreviewStats liveStats;
         liveStats.lcRound         = lcRound;
@@ -598,8 +618,8 @@ void FrameToFrameLoopClosure::process(mrpt::maps::CSimpleMap& sm)  // NOLINT
 
             // Decimate the frame IDs so we are effectively counting "blocks" of frames for what
             // concerns already-checked:
-            const auto frameGroup_i = mrpt::round(static_cast<double>(lc.frame_i) / frameGroup);
-            const auto frameGroup_j = mrpt::round(static_cast<double>(lc.frame_j) / frameGroup);
+            const auto frameGroup_i = frame_group_of(lc.frame_i, params_.min_frames_between_lc);
+            const auto frameGroup_j = frame_group_of(lc.frame_j, params_.min_frames_between_lc);
 
             const auto IDs = std::make_pair(
                 std::min<frame_id_t>(frameGroup_i, frameGroup_j),
@@ -724,8 +744,7 @@ void FrameToFrameLoopClosure::process(mrpt::maps::CSimpleMap& sm)  // NOLINT
         {
             try
             {
-                newPose->cov = mrpt::gtsam_wrappers::to_mrpt_se3_cov6(
-                    state_.graphMarginals->marginalCovariance(X(id)));
+                newPose->cov = state_.get_pose_cov(id);
             }
             catch (const std::exception& e)
             {
@@ -744,6 +763,12 @@ void FrameToFrameLoopClosure::process(mrpt::maps::CSimpleMap& sm)  // NOLINT
     }
 
     sm = outSM;  // TODO: Make CSimpleMap move constructible
+}
+
+double FrameToFrameLoopClosure::first_pose_prior_sigma() const
+{
+    // Very weak with GNSS, so the GNSS factors can override it as needed.
+    return params_.use_gnss ? 1e+2 : 1e-2;
 }
 
 void FrameToFrameLoopClosure::build_initial_graph()
@@ -772,12 +797,13 @@ void FrameToFrameLoopClosure::build_initial_graph()
 
     // Add prior on first frame: very weak, so GNSS can override it as needed.
     // if not using GNSS, let X(0) be anchored.
-    const double priorSigma = params_.use_gnss ? 1e+2 : 1e-2;
+    const double priorSigma = first_pose_prior_sigma();
 
     const auto pose0      = frame_pose_in_simplemap(0);
     auto       priorNoise = gtsam::noiseModel::Isotropic::Sigma(6, priorSigma);
 
     state_.knownInlierFactorIndices.push_back(state_.graphFG.size());
+    state_.firstPosePriorFactorIndex = state_.graphFG.size();
     state_.graphFG.emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(
         X(0), mrpt::gtsam_wrappers::toPose3(pose0), priorNoise);
 
@@ -819,12 +845,8 @@ void FrameToFrameLoopClosure::build_initial_graph()
     MRPT_LOG_INFO_STREAM("Built initial graph with " << sm.size() << " frames");
 }
 
-void FrameToFrameLoopClosure::add_gnss_factors()
+lc_common::GnssFactorParams FrameToFrameLoopClosure::gnss_factor_params() const
 {
-    mrpt::system::CTimeLoggerEntry tle(profiler_, "add_gnss_factors");
-
-    ASSERT_(state_.sm);
-
     lc_common::GnssFactorParams p;
     p.add_horizontality       = params_.gnss_add_horizontality;
     p.horizontality_sigma_rpy = params_.gnss_horizontality_sigma_rpy;
@@ -832,9 +854,50 @@ void FrameToFrameLoopClosure::add_gnss_factors()
     p.uncertainty_multiplier  = params_.gnss_edges_uncertainty_multiplier;
     p.max_uncertainty_horiz   = params_.gnss_max_uncertainty_horiz;
     p.max_uncertainty_vert    = params_.gnss_max_uncertainty_vert;
+    return p;
+}
 
+void FrameToFrameLoopClosure::add_gnss_factors()
+{
+    mrpt::system::CTimeLoggerEntry tle(profiler_, "add_gnss_factors");
+    ASSERT_(state_.sm);
     lc_common::add_gnss_factors_per_kf(
-        state_.graphFG, *state_.sm, state_.globalGeoRef, p, state_.knownInlierFactorIndices, this);
+        state_.graphFG, *state_.sm, state_.globalGeoRef, gnss_factor_params(),
+        state_.knownInlierFactorIndices, this);
+}
+
+void FrameToFrameLoopClosure::align_initial_values_to_gnss()
+{
+    using gtsam::symbol_shorthand::X;
+
+    mrpt::system::CTimeLoggerEntry tle(profiler_, "align_initial_values_to_gnss");
+    ASSERT_(state_.sm);
+
+    const auto fit = lc_common::fit_yaw_translation_to_gnss(
+        *state_.sm, state_.globalGeoRef, gnss_factor_params(),
+        [this](size_t id) { return state_.get_pose(id); }, this);
+    if (!fit)
+    {
+        MRPT_LOG_WARN("GNSS initial alignment skipped: starting from the odometry frame");
+        return;
+    }
+    const auto T = mrpt::gtsam_wrappers::toPose3(*fit);
+    for (size_t i = 0; i < state_.sm->size(); i++)
+    {
+        state_.graphValues.update(X(i), T.compose(state_.graphValues.at<gtsam::Pose3>(X(i))));
+    }
+
+    // Move the (weak) prior on the first keyframe along, so it does not pull
+    // against the aligned start:
+    const auto alignedPose0 = T.compose(mrpt::gtsam_wrappers::toPose3(frame_pose_in_simplemap(0)));
+    auto       priorNoise   = gtsam::noiseModel::Isotropic::Sigma(6, first_pose_prior_sigma());
+#if GTSAM_USES_BOOST
+    auto prior =
+        boost::make_shared<gtsam::PriorFactor<gtsam::Pose3>>(X(0), alignedPose0, priorNoise);
+#else
+    auto prior = std::make_shared<gtsam::PriorFactor<gtsam::Pose3>>(X(0), alignedPose0, priorNoise);
+#endif
+    state_.graphFG.replace(state_.firstPosePriorFactorIndex, prior);
 }
 
 bool FrameToFrameLoopClosure::add_imu_gravity_factors()
@@ -1054,17 +1117,17 @@ void FrameToFrameLoopClosure::add_manual_loop_closure_factors()
 
 auto FrameToFrameLoopClosure::
     find_loop_candidates(  // NOLINT(readability-function-cognitive-complexity)
-        const std::set<std::pair<frame_id_t, frame_id_t>>& alreadyChecked,
-        frame_id_t minLaterFrame) const -> std::vector<FrameToFrameLoopClosure::LoopCandidate>
+        const std::set<std::pair<frame_id_t, frame_id_t>>& alreadyChecked, frame_id_t minLaterFrame,
+        const std::set<std::pair<frame_id_t, frame_id_t>>* excludedFramePairs) const
+    -> std::vector<FrameToFrameLoopClosure::LoopCandidate>
 {
     mrpt::system::CTimeLoggerEntry tle(profiler_, "find_loop_candidates");
 
     ASSERT_(state_.sm);
     const auto& sm = *state_.sm;
 
-    const auto   frameGroup = static_cast<double>(params_.min_frames_between_lc);
-    const double minDist    = params_.min_distance_between_frames;
-    const double maxDist    = params_.max_distance_for_lc_candidate;
+    const double minDist = params_.min_distance_between_frames;
+    const double maxDist = params_.max_distance_for_lc_candidate;
 
     // For multi-objective strategy: track selected distances and spatial
     // midpoints so the greedy selection step can update scores incrementally.
@@ -1088,6 +1151,21 @@ auto FrameToFrameLoopClosure::
     // Single vector for non-stratified approaches
     std::vector<LoopCandidate> candidates;
 
+    // Block pairs holding an excluded pair: their other pairs rank after those
+    // of the rest (all scores are in [0,1]), so places already closed do not
+    // use up the candidate budget of the ones never checked.
+    std::set<std::pair<frame_id_t, frame_id_t>> excludedBlocks;
+    if (excludedFramePairs != nullptr)
+    {
+        for (const auto& [a, b] : *excludedFramePairs)
+        {
+            const auto ga = frame_group_of(a, params_.min_frames_between_lc);
+            const auto gb = frame_group_of(b, params_.min_frames_between_lc);
+            excludedBlocks.insert({std::min(ga, gb), std::max(ga, gb)});
+        }
+    }
+    constexpr double EXCLUDED_BLOCK_SCORE_OFFSET = 1.0;
+
     // ========================================================================
     // STEP 1: Generate and score all candidates
     // ========================================================================
@@ -1103,14 +1181,20 @@ auto FrameToFrameLoopClosure::
         for (size_t j = jStart; j < sm.size(); j++)
         {
             // Check if already evaluated
-            const auto frameGroup_i = mrpt::round(static_cast<double>(i) / frameGroup);
-            const auto frameGroup_j = mrpt::round(static_cast<double>(j) / frameGroup);
+            const auto frameGroup_i = frame_group_of(i, params_.min_frames_between_lc);
+            const auto frameGroup_j = frame_group_of(j, params_.min_frames_between_lc);
 
             const auto IDs = std::make_pair(
                 std::min<frame_id_t>(frameGroup_i, frameGroup_j),
                 std::max<frame_id_t>(frameGroup_i, frameGroup_j));
 
             if (alreadyChecked.count(IDs) != 0)
+            {
+                continue;
+            }
+            if (excludedFramePairs != nullptr &&
+                excludedFramePairs->count(
+                    {static_cast<frame_id_t>(i), static_cast<frame_id_t>(j)}) != 0)
             {
                 continue;
             }
@@ -1175,6 +1259,12 @@ auto FrameToFrameLoopClosure::
                 }
             }
 
+            lc.in_excluded_block = excludedBlocks.count(IDs) != 0;
+            if (lc.in_excluded_block)
+            {
+                lc.score -= EXCLUDED_BLOCK_SCORE_OFFSET;
+            }
+
             // Add to appropriate container
             if (useStratification)
             {
@@ -1210,17 +1300,15 @@ auto FrameToFrameLoopClosure::
     // keeping the highest-scored candidate per block pair -- so that
     // max_lc_candidates truly reflects the number that will be evaluated.
     {
-        auto dedup = [&frameGroup](std::vector<LoopCandidate>& vec)
+        auto dedup = [this](std::vector<LoopCandidate>& vec)
         {
             std::map<std::pair<frame_id_t, frame_id_t>, size_t> best;  // blockPair -> index
             for (size_t k = 0; k < vec.size(); k++)
             {
-                const auto bg_i = static_cast<frame_id_t>(
-                    mrpt::round(static_cast<double>(vec[k].frame_i) / frameGroup));
-                const auto bg_j = static_cast<frame_id_t>(
-                    mrpt::round(static_cast<double>(vec[k].frame_j) / frameGroup));
-                const auto key = std::make_pair(std::min(bg_i, bg_j), std::max(bg_i, bg_j));
-                auto       it  = best.find(key);
+                const auto bg_i = frame_group_of(vec[k].frame_i, params_.min_frames_between_lc);
+                const auto bg_j = frame_group_of(vec[k].frame_j, params_.min_frames_between_lc);
+                const auto key  = std::make_pair(std::min(bg_i, bg_j), std::max(bg_i, bg_j));
+                auto       it   = best.find(key);
                 if (it == best.end() || vec[k].score > vec[it->second].score)
                 {
                     best[key] = k;
@@ -1343,6 +1431,10 @@ auto FrameToFrameLoopClosure::
                 args.wDiv              = params_.lc_weight_diversity;
                 args.wCov              = params_.lc_weight_coverage;
                 lc.score               = score_multi_objective(args);
+                if (lc.in_excluded_block)
+                {
+                    lc.score -= EXCLUDED_BLOCK_SCORE_OFFSET;
+                }
             }
         }
     }
@@ -1513,7 +1605,27 @@ std::optional<FrameToFrameLoopClosure::LcIcpEdge> FrameToFrameLoopClosure::run_l
     update_dynamic_variables(lc.frame_j, threadIdx);
 
     mp2p_icp::Results icp_result;
-    pts.pipeline.icp->align(*pc_j, *pc_i, initGuess, params_.icp_parameters, icp_result);
+    try
+    {
+        pts.pipeline.icp->align(*pc_j, *pc_i, initGuess, params_.icp_parameters, icp_result);
+    }
+    catch (const std::exception& e)
+    {
+        // A degenerate registration (e.g. too few pairings for a valid
+        // covariance) rejects this candidate, not the whole run. If no
+        // candidate has ever succeeded, the ICP setup itself is broken.
+        const auto nFailed = ++state_.lcIcpFailed;
+        if (state_.lcIcpCompleted == 0 && nFailed >= MAX_LC_ICP_FAILURES_WITHOUT_SUCCESS)
+        {
+            MRPT_LOG_ERROR_STREAM("All " << nFailed << " loop-closure ICP runs failed: aborting.");
+            throw;
+        }
+        MRPT_LOG_WARN_STREAM(
+            "ICP " << lc.frame_i << " <-> " << lc.frame_j
+                   << " failed, candidate rejected: " << mrpt::exception_to_str(e));
+        return std::nullopt;
+    }
+    state_.lcIcpCompleted++;
 
     const auto poseDelta = (icp_result.optimal_tf.getMeanVal().asTPose() - initGuess);
 
@@ -1581,7 +1693,12 @@ std::optional<size_t> FrameToFrameLoopClosure::process_loop_candidate(const Loop
     const size_t newFactorIdx = state_.graphFG.size();
     const auto   deltaPose    = mrpt::gtsam_wrappers::toPose3(edge->relPose.mean);
 
-    auto edgeNoise = gtsam::noiseModel::Diagonal::Sigmas(edge->sigmas);
+    // edge->sigmas are the diagonal of an MRPT covariance (global translation,
+    // yaw/pitch/roll): convert it into the GTSAM tangent of the relative pose.
+    gtsam::Pose3   unusedPose;
+    gtsam::Matrix6 edgeCov;
+    mola::gtsam_compat::to_gtsam_se3_cov6(edge->relPose, unusedPose, edgeCov);
+    auto edgeNoise = gtsam::noiseModel::Gaussian::Covariance(edgeCov);
 
     // LC edges use plain Gaussian noise (no robust kernel here).
     // The GNC optimizer handles outlier rejection for these edges.
@@ -1647,13 +1764,14 @@ std::vector<ProposedLoopEdge> FrameToFrameLoopClosure::analyze(
         state_.graphValues.insert(X(i), mrpt::gtsam_wrappers::toPose3(frame_pose_in_simplemap(i)));
     }
 
-    // Seed with pairs the caller already closed so candidate selection skips
-    // them and spends its budget on as-yet-unclosed loops (drives the finalize
-    // cascade toward new revisit regions each round).
-    const std::set<std::pair<frame_id_t, frame_id_t>> alreadyChecked(
-        opts.exclude_pairs.begin(), opts.exclude_pairs.end());
+    // Skip the keyframe pairs the caller excludes (e.g. loops it already closed or
+    // rejected), so candidate selection spends its budget on other pairs: the
+    // next best pair of the same block pair, or new revisit regions (drives the
+    // finalize cascade). Only those exact pairs: whole block pairs would allow a
+    // single loop per revisited region.
+    const std::set<std::pair<frame_id_t, frame_id_t>> noBlocks;
     const frame_id_t minLaterFrame = opts.first_new_keyframe.value_or(0);
-    const auto       candidates    = find_loop_candidates(alreadyChecked, minLaterFrame);
+    const auto candidates = find_loop_candidates(noBlocks, minLaterFrame, &opts.exclude_pairs);
 
     MRPT_LOG_INFO_STREAM(
         "analyze(): " << candidates.size() << " loop closure candidates"
@@ -2099,7 +2217,9 @@ mrpt::math::CMatrixDouble66 FrameToFrameLoopClosure::State::get_pose_cov(frame_i
     using gtsam::symbol_shorthand::X;
     ASSERT_(graphMarginals.has_value());
 
-    return mrpt::gtsam_wrappers::to_mrpt_se3_cov6(graphMarginals->marginalCovariance(X(id)));
+    return mola::gtsam_compat::to_mrpt_se3_pdf(
+               graphValues.at<gtsam::Pose3>(X(id)), graphMarginals->marginalCovariance(X(id)))
+        .cov;
 }
 
 void FrameToFrameLoopClosure::update_dynamic_variables(frame_id_t frameId, size_t threadIdx)
@@ -2496,18 +2616,22 @@ void FrameToFrameLoopClosure::save_trajectory_as_tum(
     const std::string& filename, bool saveCovariancesToo) const
 {
     ASSERT_(state_.sm);
-    if (saveCovariancesToo)
+
+    // Marginals may be unavailable for an ill-conditioned graph (e.g. a very stiff
+    // odometry with only a weak prior): save the poses anyway.
+    const bool withCov = saveCovariancesToo && state_.graphMarginals.has_value();
+    if (saveCovariancesToo && !withCov)
     {
-        ASSERT_(state_.graphMarginals.has_value());
+        MRPT_LOG_WARN_STREAM("No graph marginals: saving '" << filename << "' without covariances");
     }
 
     std::function<mrpt::math::CMatrixDouble66(size_t)> covOf;
-    if (saveCovariancesToo)
+    if (withCov)
     {
         covOf = [this](size_t id) { return state_.get_pose_cov(id); };
     }
 
     lc_common::save_trajectory_as_tum(
         filename, *state_.sm, [this](size_t id) { return state_.get_pose(id); },
-        saveCovariancesToo ? &covOf : nullptr, const_cast<FrameToFrameLoopClosure*>(this));
+        withCov ? &covOf : nullptr, const_cast<FrameToFrameLoopClosure*>(this));
 }
