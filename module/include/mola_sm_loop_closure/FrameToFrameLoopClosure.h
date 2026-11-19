@@ -20,6 +20,7 @@
 #include <mola_sm_loop_closure/LoopClosureInterface.h>
 #include <mola_sm_loop_closure/common/gnss_factor_helpers.h>
 #include <mola_sm_loop_closure/common/icp_pipeline_setup.h>
+#include <mola_sm_loop_closure/global_registration/bev_correlation.h>
 #include <mp2p_icp/icp_pipeline_from_yaml.h>
 #include <mp2p_icp/metricmap.h>
 #include <mp2p_icp_filters/FilterBase.h>
@@ -219,8 +220,10 @@ class FrameToFrameLoopClosure : public mola::LoopClosureInterface
          *  independent pairwise registrations, so this speeds up both live scans
          *  and the finalize pass roughly linearly with core count. */
         bool parallel_icp_enabled = true;
-        /** Number of worker threads for candidate ICP. 0 = one per per-thread
-         *  ICP slot (hardware concurrency). Clamped to the number of slots. */
+        /** Number of worker threads for candidate ICP. 0 = auto (a quarter of
+         *  the hardware concurrency). It also sets how many per-thread ICP slots
+         *  (pipeline, KISS-Matcher instance, share of the point-cloud cache) are
+         *  created, so memory scales with it. */
         size_t num_icp_threads = 0;
 
         /** Master switch for a REPRODUCIBLE scan: the same simplemap in gives
@@ -325,6 +328,31 @@ class FrameToFrameLoopClosure : public mola::LoopClosureInterface
          *  instead. */
         uint32_t kiss_matcher_min_inliers = 5;
 
+        // ===== Global registration initial guess =====
+        /** Global registration that seeds the ICP of each loop closure
+         *  candidate, instead of the current graph estimate:
+         *  - "none": the graph estimate only.
+         *  - "kiss": KISS-Matcher (see the parameters above).
+         *  - "bev": global_registration::bev_correlation(), a gravity-aligned
+         *    4-DoF search; it needs keyframe poses with absolute roll and pitch
+         *    (e.g. from LiDAR-inertial odometry).
+         *  Empty: "kiss" if use_kiss_matcher is true, "none" otherwise. */
+        std::string global_registration;
+
+        /** Metric-map layer of each keyframe fed into the "bev" global
+         *  registration. Must contain an mrpt::maps::CPointsMap. */
+        std::string global_registration_layer = "points_to_register_points";
+
+        /** Parameters of the "bev" global registration (YAML map
+         *  `bev_correlation`). */
+        mola::global_registration::BevCorrelationParameters bev_correlation;
+
+        /** If true, a candidate whose "bev" global registration finds a match
+         *  but cannot tell it from another clearly different one (repetitive
+         *  structure) is rejected, instead of running ICP from the graph
+         *  estimate. */
+        bool skip_ambiguous_candidates = true;
+
         // ===== Manual Loop Closure Hints =====
         struct ManualLoopConstraint
         {
@@ -390,9 +418,8 @@ class FrameToFrameLoopClosure : public mola::LoopClosureInterface
         /// (no unload) since we must not mutate the borrowed map.
         bool readOnlySnapshot = false;
 
-        // Per-thread ICP instances
-        std::vector<PerThreadState> perThreadState_{
-            std::max(1u, std::thread::hardware_concurrency())};
+        // Per-thread ICP instances, one per worker (sized in initialize()).
+        std::vector<PerThreadState> perThreadState_ = std::vector<PerThreadState>(1);
 
         // GNSS reference coordinate
         std::optional<mrpt::topography::TGeodeticCoords> globalGeoRef;
@@ -435,7 +462,7 @@ class FrameToFrameLoopClosure : public mola::LoopClosureInterface
     State state_;
 
     mrpt::system::CTimeLogger profiler_{true, "frame_to_frame_lc"};
-    mrpt::WorkerThreadsPool   threads_{state_.perThreadState_.size()};
+    mrpt::WorkerThreadsPool   threads_;  // grown in initialize()
 
     // Private methods
     mrpt::poses::CPose3D frame_pose_in_simplemap(frame_id_t frameId) const;
