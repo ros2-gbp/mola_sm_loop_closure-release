@@ -66,6 +66,7 @@
 #include <cstring>
 #include <future>
 #include <mutex>
+#include <thread>
 
 #include "DeterministicScope.h"
 
@@ -231,7 +232,6 @@ uint32_t frame_group_of(std::size_t i, std::size_t group)
 FrameToFrameLoopClosure::FrameToFrameLoopClosure()
 {
     mrpt::system::COutputLogger::setLoggerName("FrameToFrameLoopClosure");
-    threads_.name("f2f_icp_threads");
 }
 
 void FrameToFrameLoopClosure::initialize(const mrpt::containers::yaml& c)
@@ -317,6 +317,30 @@ void FrameToFrameLoopClosure::initialize(const mrpt::containers::yaml& c)
     YAML_LOAD_OPT(params_, kiss_matcher_layer, std::string);
     YAML_LOAD_OPT(params_, kiss_matcher_min_inliers, uint32_t);
 
+    YAML_LOAD_OPT(params_, global_registration, std::string);
+    YAML_LOAD_OPT(params_, global_registration_layer, std::string);
+    YAML_LOAD_OPT(params_, skip_ambiguous_candidates, bool);
+    if (cfg.has("bev_correlation"))
+    {
+        params_.bev_correlation.load_from_yaml(cfg["bev_correlation"]);
+    }
+    if (params_.global_registration.empty())
+    {
+        params_.global_registration = params_.use_kiss_matcher ? "kiss" : "none";
+    }
+    else if (params_.use_kiss_matcher && params_.global_registration != "kiss")
+    {
+        MRPT_LOG_INFO_STREAM(
+            "use_kiss_matcher ignored: global_registration=" << params_.global_registration);
+    }
+    ASSERTMSG_(
+        params_.global_registration == "none" || params_.global_registration == "kiss" ||
+            params_.global_registration == "bev",
+        mrpt::format(
+            "global_registration: unknown value '%s' (expected none, kiss or bev)",
+            params_.global_registration.c_str()));
+    params_.use_kiss_matcher = (params_.global_registration == "kiss");
+
     YAML_LOAD_OPT(params_, largest_delta_for_reconsider, double);
     YAML_LOAD_OPT(params_, max_sensor_range, double);
 
@@ -373,6 +397,26 @@ void FrameToFrameLoopClosure::initialize(const mrpt::containers::yaml& c)
 
     profiler_.enable(params_.profiler_enabled);
 
+    // One ICP slot per candidate worker: each slot holds a pipeline, a
+    // KISS-Matcher instance and a share of the point-cloud cache, so sizing
+    // them by the cores instead would cost memory for workers never used.
+    size_t nSlots = 1;
+    if (params_.parallel_icp_enabled)
+    {
+        // Auto (0): ~1/4 of the cores. mp2p_icp already parallelizes each ICP
+        // internally with TBB, so one outer thread per core just oversubscribes
+        // the shared TBB pool; the measured speedup flattens out by ~cores/4.
+        const size_t cores = std::max(1u, std::thread::hardware_concurrency());
+        nSlots =
+            params_.num_icp_threads == 0 ? std::max<size_t>(1, cores / 4) : params_.num_icp_threads;
+    }
+    state_.perThreadState_ = std::vector<PerThreadState>(nSlots);
+    if (nSlots > 1 && threads_.size() < nSlots)
+    {
+        threads_.resize(nSlots - threads_.size());
+        threads_.name("f2f_icp_threads");
+    }
+
     // Initialize ICP pipelines for each thread
     for (auto& pts : state_.perThreadState_)
     {
@@ -405,10 +449,17 @@ void FrameToFrameLoopClosure::initialize(const mrpt::containers::yaml& c)
     if (params_.use_kiss_matcher)
     {
         MRPT_LOG_WARN(
-            "use_kiss_matcher=true but this build lacks KISS-Matcher support "
+            "global_registration=kiss but this build lacks KISS-Matcher support "
             "(populate the third_party/kiss-matcher submodule and rebuild); ignoring.");
     }
 #endif
+    if (params_.global_registration == "bev")
+    {
+        MRPT_LOG_INFO_STREAM(
+            "BEV correlation global registration enabled: resolution="
+            << params_.bev_correlation.grid_resolution << " m, layer='"
+            << params_.global_registration_layer << "'");
+    }
 
     state_.initialized = true;
 
@@ -951,7 +1002,7 @@ bool FrameToFrameLoopClosure::add_imu_gravity_factors()
         }
         const auto& normalizedAcc = *frame.normalizedAcc;
 #else
-        const auto& normalizedAcc = frame.normalizedAcc;
+        const auto& normalizedAcc         = frame.normalizedAcc;
 #endif
         const auto sensorOnVehicle = mrpt::gtsam_wrappers::toPose3(frame.sensorPoseOnVehicle);
         state_.knownInlierFactorIndices.push_back(state_.graphFG.size());
@@ -1047,10 +1098,14 @@ void FrameToFrameLoopClosure::add_manual_loop_closure_factors()
             continue;
         }
 
+        // With a global registration, compute the actual relative pose (+ ICP)
+        // rather than assuming an identity transform.
 #ifdef MOLA_HAS_KISS_MATCHER
-        // When KISS-Matcher is available, use it (+ ICP) to compute the actual
-        // relative pose rather than assuming an identity transform.
-        if (params_.use_kiss_matcher)
+        const bool hasGlobalRegistration = params_.global_registration != "none";
+#else
+        const bool  hasGlobalRegistration = params_.global_registration == "bev";
+#endif
+        if (hasGlobalRegistration)
         {
             LoopCandidate lc;
             lc.frame_i = fi;
@@ -1064,21 +1119,20 @@ void FrameToFrameLoopClosure::add_manual_loop_closure_factors()
                 if (mlc.trust_as_inlier) state_.knownInlierFactorIndices.push_back(*km_result);
                 addedCount++;
                 MRPT_LOG_INFO_STREAM(
-                    "Manual LC (KISS-Matcher+ICP) added: frame "
-                    << fi << " (t=" << mlc.timestamp_i << ") <-> frame " << fj
-                    << " (t=" << mlc.timestamp_j << ")");
+                    "Manual LC (" << params_.global_registration << " + ICP) added: frame " << fi
+                                  << " (t=" << mlc.timestamp_i << ") <-> frame " << fj
+                                  << " (t=" << mlc.timestamp_j << ")");
                 continue;
             }
             MRPT_LOG_WARN_STREAM(
-                "Manual LC: KISS-Matcher+ICP failed for frames "
-                << fi << "<->" << fj
-                << " (ICP quality too low); falling back to identity constraint "
-                   "with sigma_xyz="
-                << mlc.sigma_xyz << " m");
+                "Manual LC: " << params_.global_registration << " + ICP failed for frames " << fi
+                              << "<->" << fj
+                              << " (ICP quality too low); falling back to identity constraint "
+                                 "with sigma_xyz="
+                              << mlc.sigma_xyz << " m");
         }
-#endif
 
-        // Fallback (or when KISS-Matcher is disabled): identity pose constraint
+        // Fallback (or without a global registration): identity pose constraint
         // with a tight XYZ sigma and unconstrained angles.
         const auto deltaPose = gtsam::Pose3::Identity();
 
@@ -1097,7 +1151,7 @@ void FrameToFrameLoopClosure::add_manual_loop_closure_factors()
         auto factor = boost::make_shared<gtsam::BetweenFactor<gtsam::Pose3>>(
             X(fi), X(fj), deltaPose, edgeNoise);
 #else
-        auto        factor        = std::make_shared<gtsam::BetweenFactor<gtsam::Pose3>>(
+        auto        factor                = std::make_shared<gtsam::BetweenFactor<gtsam::Pose3>>(
             X(fi), X(fj), deltaPose, edgeNoise);
 #endif
         state_.graphFG += factor;
@@ -1600,6 +1654,61 @@ std::optional<FrameToFrameLoopClosure::LcIcpEdge> FrameToFrameLoopClosure::run_l
     }
 #endif
 
+    if (params_.global_registration == "bev")
+    {
+        std::optional<mrpt::system::CTimeLoggerEntry> tle_bev;
+        if (profile)
+        {
+            tle_bev.emplace(profiler_, "bev_initial_guess");
+        }
+        const auto layerOf = [&](const mp2p_icp::metric_map_t& pc) -> mrpt::maps::CPointsMap::Ptr
+        {
+            const auto it = pc.layers.find(params_.global_registration_layer);
+            if (it == pc.layers.end())
+            {
+                return {};
+            }
+            return std::dynamic_pointer_cast<mrpt::maps::CPointsMap>(it->second);
+        };
+        const auto pts_i = layerOf(*pc_i);
+        const auto pts_j = layerOf(*pc_j);
+        if (pts_i && pts_j && !pts_i->empty() && !pts_j->empty())
+        {
+            // Only the roll and pitch of the keyframe poses are used:
+            const auto r = mola::global_registration::bev_correlation(
+                *pts_i, pose_i, *pts_j, pose_j, params_.bev_correlation);
+            if (r.valid)
+            {
+                initGuess = r.pose.asTPose();
+                MRPT_LOG_DEBUG_STREAM(
+                    "BEV guess for LC " << lc.frame_i << "<->" << lc.frame_j << " score=" << r.score
+                                        << " ambiguity_ratio=" << r.ambiguity_ratio
+                                        << " T=" << initGuess);
+            }
+            else if (
+                params_.skip_ambiguous_candidates && r.score >= params_.bev_correlation.min_score)
+            {
+                MRPT_LOG_INFO_STREAM(
+                    "LC " << lc.frame_i << "<->" << lc.frame_j
+                          << " rejected: ambiguous BEV match (score=" << r.score
+                          << " ambiguity_ratio=" << r.ambiguity_ratio << ")");
+                return std::nullopt;
+            }
+            else
+            {
+                MRPT_LOG_DEBUG_STREAM(
+                    "BEV guess rejected for LC " << lc.frame_i << "<->" << lc.frame_j << " (score="
+                                                 << r.score << "); using graph-based guess");
+            }
+        }
+        else
+        {
+            MRPT_LOG_THROTTLE_WARN_STREAM(
+                5.0, "Layer '" << params_.global_registration_layer << "' missing or empty for LC "
+                               << lc.frame_i << "<->" << lc.frame_j << "; using graph-based guess");
+        }
+    }
+
     // Run ICP
 
     update_dynamic_variables(lc.frame_j, threadIdx);
@@ -1797,9 +1906,8 @@ std::vector<ProposedLoopEdge> FrameToFrameLoopClosure::analyze(
     reportProgress();  // initial (0 / total), so a listener sees the queue fill
 
     // Loop-closure candidates are independent pairwise registrations, so their
-    // ICP tests can run concurrently. Resolve the worker count: one per-thread
-    // ICP slot (each with its own pipeline + KISS-Matcher instance), optionally
-    // capped by num_icp_threads, and never more than the candidate count.
+    // ICP tests can run concurrently: one worker per ICP slot (see
+    // initialize()), never more than the candidate count.
     //
     // `deterministic` does NOT turn off candidate parallelism, and that is a
     // measured decision rather than an oversight. Once the reduction underneath
@@ -1811,24 +1919,8 @@ std::vector<ProposedLoopEdge> FrameToFrameLoopClosure::analyze(
     // determinism gained.
     const DeterministicScope detScope{params_.deterministic, this};
 
-    size_t nThreads = 1;
-    if (params_.parallel_icp_enabled)
-    {
-        const size_t slots = state_.perThreadState_.size();
-        // Auto (0): use ~1/4 of the cores. mp2p_icp already parallelizes each ICP
-        // internally with TBB, so one outer thread per core just oversubscribes
-        // the shared TBB pool; the measured speedup flattens out by ~cores/4.
-        //
-        // cores/4 stays the auto value under `deterministic` too. Taking all the
-        // slots instead was tried, on the theory that pinning the inner runtimes
-        // leaves nothing to oversubscribe, and measured WORSE on KITTI-07 (47-50 s
-        // against 40 s): the per-thread point-cloud cache is
-        // pc_cache_max_bytes/slots, so more slots means a smaller cache each and
-        // more clouds regenerated.
-        nThreads = params_.num_icp_threads == 0 ? std::max<size_t>(1, slots / 4)
-                                                : std::min(params_.num_icp_threads, slots);
-        nThreads = std::clamp<size_t>(nThreads, 1, std::max<size_t>(1, candidates.size()));
-    }
+    const size_t nThreads = std::clamp<size_t>(
+        state_.perThreadState_.size(), 1, std::max<size_t>(1, candidates.size()));
 
     // Evaluate one candidate on ICP slot `slot`; returns the accepted edge (if
     // any). A single degenerate candidate (e.g. a scan missing the registration
