@@ -1,3 +1,26 @@
+## mola_sm_loop_closure (jazzy) - 1.5.0-1
+
+The packages in the `mola_sm_loop_closure` repository were released into the `jazzy` distro by running `/home/jlblanco/.local/bin/bloom-release --rosdistro jazzy --track jazzy mola_sm_loop_closure -y --no-web` on `Thu, 19 Nov 2026 23:49:07 -0000`
+
+The `mola_sm_loop_closure` package was released.
+
+Version of package(s) in repository `mola_sm_loop_closure`:
+
+- upstream repository: https://github.com/MOLAorg/mola_sm_loop_closure.git
+- release repository: https://github.com/ros2-gbp/mola_sm_loop_closure-release.git
+- rosdistro version: `1.4.0-1`
+- old version: `1.4.0-1`
+- new version: `1.5.0-1`
+
+Versions of tools used:
+
+- bloom version: `0.14.4`
+- catkin_pkg version: `1.1.1`
+- rosdep version: `0.27.0`
+- rosdistro version: `1.1.0`
+- vcstools version: `0.1.42`
+
+
 ## mola_sm_loop_closure (humble) - 1.5.0-1
 
 The packages in the `mola_sm_loop_closure` repository were released into the `humble` distro by running `/home/jlblanco/.local/bin/bloom-release --rosdistro humble --track humble mola_sm_loop_closure -y --no-web` on `Thu, 19 Nov 2026 23:47:41 -0000`
